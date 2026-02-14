@@ -211,6 +211,7 @@ MOUNT_DST=""
 MOUNT_BOOT=""
 LUKS_UUID=""
 LUKS_PASS=""
+BACKUP_BASE=""
 BACKUP_DIR=""
 BACKUP_COUNT=0
 
@@ -292,17 +293,6 @@ _find_backup_dir() {
 if [ "$EUID" -ne 0 ]; then
   fail "This script must be run as root (sudo)."
 fi
-
-# --- Prompt for empty tang servers ---
-for i in "${!TANG_SERVERS[@]}"; do
-  if [ -z "${TANG_SERVERS[$i]}" ]; then
-    read -rp "Tang server $((i+1)) URL (e.g. http://tang.example.com): " url
-    if [ -z "$url" ]; then
-      fail "Tang server $((i+1)) must not be empty."
-    fi
-    TANG_SERVERS[$i]="$url"
-  fi
-done
 
 # --spi-only: skip everything and jump straight to SPI flash
 if [ "$SPI_ONLY" = true ]; then
@@ -590,6 +580,11 @@ _read_luks_conf_from_root() {
     [ -z "$BOARD_TYPE" ] && BOARD_TYPE=$(grep '^BOARD_TYPE=' "$conf" | cut -d'"' -f2)
     SCENARIO=$(grep '^SCENARIO=' "$conf" | cut -d'"' -f2)
     SOURCE_DEVICE=$(grep '^SOURCE_DEVICE=' "$conf" | cut -d'"' -f2)
+    local _ts1 _ts2
+    _ts1=$(grep '^TANG_SERVER_1=' "$conf" | cut -d'"' -f2)
+    _ts2=$(grep '^TANG_SERVER_2=' "$conf" | cut -d'"' -f2)
+    [ -z "${TANG_SERVERS[0]}" ] && [ -n "$_ts1" ] && TANG_SERVERS[0]="$_ts1"
+    [ -z "${TANG_SERVERS[1]}" ] && [ -n "$_ts2" ] && TANG_SERVERS[1]="$_ts2"
     return 0
   fi
   return 1
@@ -684,8 +679,8 @@ fi
 # =====================================================================
 
 if [ -z "$PI_DEVICE" ] || [ -z "$PI_BOOT_PART" ] || [ -z "$PI_ROOT_PART" ]; then
-  # In local mode, try reading luks.conf from the live system first
-  if [ "$LOCAL_MODE" = true ] && [ -f /root/luks-staged/luks.conf ]; then
+  # Try reading luks.conf from the live system (works for local mode and nvme_migrate)
+  if [ -f /root/luks-staged/luks.conf ]; then
     _read_luks_conf_from_root "" 2>/dev/null || true
     # _read_luks_conf_from_root expects mount_point prefix; read directly
     PI_DEVICE=$(grep '^PI_DEVICE=' /root/luks-staged/luks.conf | cut -d'"' -f2)
@@ -694,6 +689,10 @@ if [ -z "$PI_DEVICE" ] || [ -z "$PI_BOOT_PART" ] || [ -z "$PI_ROOT_PART" ]; then
     [ -z "$BOARD_TYPE" ] && BOARD_TYPE=$(grep '^BOARD_TYPE=' /root/luks-staged/luks.conf | cut -d'"' -f2)
     SCENARIO=$(grep '^SCENARIO=' /root/luks-staged/luks.conf | cut -d'"' -f2)
     SOURCE_DEVICE=$(grep '^SOURCE_DEVICE=' /root/luks-staged/luks.conf | cut -d'"' -f2)
+    _ts1=$(grep '^TANG_SERVER_1=' /root/luks-staged/luks.conf | cut -d'"' -f2)
+    _ts2=$(grep '^TANG_SERVER_2=' /root/luks-staged/luks.conf | cut -d'"' -f2)
+    [ -z "${TANG_SERVERS[0]}" ] && [ -n "$_ts1" ] && TANG_SERVERS[0]="$_ts1"
+    [ -z "${TANG_SERVERS[1]}" ] && [ -n "$_ts2" ] && TANG_SERVERS[1]="$_ts2"
     if [ -n "$PI_DEVICE" ]; then
       ok "Read device info from live system luks.conf: $PI_DEVICE (scenario: ${SCENARIO:-unknown})"
     fi
@@ -730,6 +729,10 @@ if [ -z "$PI_DEVICE" ] || [ -z "$PI_BOOT_PART" ] || [ -z "$PI_ROOT_PART" ]; then
         [ -z "$BOARD_TYPE" ] && BOARD_TYPE=$(grep '^BOARD_TYPE=' "$_bkp_conf" | cut -d'"' -f2)
         SCENARIO=$(grep '^SCENARIO=' "$_bkp_conf" | cut -d'"' -f2)
         SOURCE_DEVICE=$(grep '^SOURCE_DEVICE=' "$_bkp_conf" | cut -d'"' -f2)
+        _ts1=$(grep '^TANG_SERVER_1=' "$_bkp_conf" | cut -d'"' -f2)
+        _ts2=$(grep '^TANG_SERVER_2=' "$_bkp_conf" | cut -d'"' -f2)
+        [ -z "${TANG_SERVERS[0]}" ] && [ -n "$_ts1" ] && TANG_SERVERS[0]="$_ts1"
+        [ -z "${TANG_SERVERS[1]}" ] && [ -n "$_ts2" ] && TANG_SERVERS[1]="$_ts2"
         if [ -n "$PI_DEVICE" ]; then
           ok "Read device info from backup luks.conf: $PI_DEVICE (board: ${BOARD_TYPE:-unknown})"
         fi
@@ -753,6 +756,25 @@ if [ -z "$PI_DEVICE" ] || [ -z "$PI_BOOT_PART" ] || [ -z "$PI_ROOT_PART" ]; then
     fi
   fi
 fi
+
+# Migrate scenarios run on the board itself — treat as local mode
+if [ "$LOCAL_MODE" = false ]; then
+  if [ "$SCENARIO" = "nvme_migrate" ] || [ "$SCENARIO" = "usb_migrate" ]; then
+    LOCAL_MODE=true
+    info "Local mode: migrating to $EXT_DEVICE from current root"
+  fi
+fi
+
+# --- Prompt for empty tang servers (after luks.conf may have filled them) ---
+for i in "${!TANG_SERVERS[@]}"; do
+  if [ -z "${TANG_SERVERS[$i]}" ]; then
+    read -rp "Tang server $((i+1)) URL (e.g. http://tang.example.com): " url
+    if [ -z "$url" ]; then
+      fail "Tang server $((i+1)) must not be empty."
+    fi
+    TANG_SERVERS[$i]="$url"
+  fi
+done
 
 # Verify root partition is ext4 (skip for nvme_migrate/usb_migrate and when resuming past encrypt)
 if [ "$START_PHASE_NUM" -le 2 ]; then
@@ -783,29 +805,43 @@ if [ -z "$BOARD_TYPE" ]; then
   info "Detected board type: $BOARD_TYPE"
 fi
 
-# Check available disk space for backup
-if [ "$LOCAL_MODE" = true ]; then
-  # In local mode, estimate used space from running root
-  ROOT_USED_KB=$(df --output=used / 2>/dev/null | tail -1 | tr -d ' ')
-  info "Root filesystem used space: ~$((ROOT_USED_KB / 1024)) MB"
-  NEEDED_KB="$ROOT_USED_KB"
-else
-  ROOT_SIZE_KB=$(blockdev --getsize64 "$EXT_ROOT_PART" 2>/dev/null | awk '{printf "%d", $1/1024}')
-  info "Root partition size: ~$((ROOT_SIZE_KB / 1024)) MB"
-  NEEDED_KB="$ROOT_SIZE_KB"
-fi
+# Check available disk space for backup (migrate scenarios copy directly, no backup needed)
+if [ "$SCENARIO" != "nvme_migrate" ] && [ "$SCENARIO" != "usb_migrate" ]; then
+  if [ "$LOCAL_MODE" = true ]; then
+    ROOT_USED_KB=$(df --output=used / 2>/dev/null | tail -1 | tr -d ' ')
+    info "Root filesystem used space: ~$((ROOT_USED_KB / 1024)) MB"
+    NEEDED_KB="$ROOT_USED_KB"
+  else
+    # External mode: mount the target root briefly to check actual used space
+    _size_probe=$(mktemp -d /tmp/luks-size-probe.XXXXXX)
+    if mount -o ro "$EXT_ROOT_PART" "$_size_probe" 2>/dev/null; then
+      ROOT_USED_KB=$(df --output=used "$_size_probe" 2>/dev/null | tail -1 | tr -d ' ')
+      umount "$_size_probe" 2>/dev/null || true
+      info "Root filesystem used space: ~$((ROOT_USED_KB / 1024)) MB"
+      NEEDED_KB="$ROOT_USED_KB"
+    else
+      # Fallback to total partition size if mount fails (e.g. corrupted from previous attempt)
+      ROOT_SIZE_KB=$(blockdev --getsize64 "$EXT_ROOT_PART" 2>/dev/null | awk '{printf "%d", $1/1024}')
+      info "Root partition size (estimate): ~$((ROOT_SIZE_KB / 1024)) MB"
+      NEEDED_KB="$ROOT_SIZE_KB"
+    fi
+    rmdir "$_size_probe" 2>/dev/null || true
+  fi
 
-TMPDIR_AVAIL_KB=$(df --output=avail /tmp 2>/dev/null | tail -1 | tr -d ' ')
-info "Available space in /tmp: ~$((TMPDIR_AVAIL_KB / 1024)) MB"
+  TMPDIR_AVAIL_KB=$(df --output=avail /tmp 2>/dev/null | tail -1 | tr -d ' ')
+  info "Available space in /tmp: ~$((TMPDIR_AVAIL_KB / 1024)) MB"
 
-if [ "$TMPDIR_AVAIL_KB" -lt "$NEEDED_KB" ]; then
-  warn "Insufficient space in /tmp for backup!"
-  read -rp "Enter an alternative backup directory with enough space: " BACKUP_BASE
-  if [ ! -d "$BACKUP_BASE" ]; then
-    fail "Directory $BACKUP_BASE does not exist"
+  if [ "$TMPDIR_AVAIL_KB" -lt "$NEEDED_KB" ]; then
+    warn "Insufficient space in /tmp for backup!"
+    read -rp "Enter an alternative backup directory with enough space: " BACKUP_BASE
+    if [ ! -d "$BACKUP_BASE" ]; then
+      fail "Directory $BACKUP_BASE does not exist"
+    fi
+  else
+    BACKUP_BASE="/tmp"
   fi
 else
-  BACKUP_BASE="/tmp"
+  info "Migration scenario: copying directly from live root (no backup needed)"
 fi
 
 echo ""
@@ -824,7 +860,9 @@ if [ "$USE_LVM" = true ]; then
 echo "  LVM:                   enabled (VG: $LVM_VG_NAME, LV: $LVM_LV_NAME, size: ${LVM_ROOT_SIZE:-100%FREE})"
 fi
 echo "  Root device:           $ROOT_DEV"
-echo "  Backup location:       $BACKUP_BASE"
+if [ -n "$BACKUP_BASE" ]; then
+  echo "  Backup location:       $BACKUP_BASE"
+fi
 echo ""
 if [ "$START_PHASE_NUM" -gt 1 ]; then
   echo -e "${YELLOW}Resuming from phase ${START_PHASE_NUM} (${PHASE_NAMES[$((START_PHASE_NUM-1))]})${NC}"
@@ -837,10 +875,16 @@ else
 fi
 
 # =====================================================================
-# 3. Backup root partition
+# 3. Backup root partition (skipped for migrate scenarios)
 # =====================================================================
 
-if [ "$START_PHASE_NUM" -le 2 ]; then
+if [ "$SCENARIO" = "nvme_migrate" ] || [ "$SCENARIO" = "usb_migrate" ]; then
+  # Migrate: no backup needed, the live root (SD card) stays untouched
+  info "=== Skipping backup (migrate: copying directly from live root) ==="
+  if [ ! -d "/root/luks-staged" ]; then
+    fail "Staged files not found (/root/luks-staged). Did you run luks_prepare.sh first?"
+  fi
+elif [ "$START_PHASE_NUM" -le 2 ]; then
 
 echo ""
 info "=== Phase 1: Backup ==="
@@ -974,7 +1018,9 @@ fi  # end phase gate: encrypt
 if [ "$START_PHASE_NUM" -le 4 ]; then
 
 if [ "$START_PHASE_NUM" -eq 4 ]; then
-  _find_backup_dir
+  if [ "$SCENARIO" != "nvme_migrate" ] && [ "$SCENARIO" != "usb_migrate" ]; then
+    _find_backup_dir
+  fi
   _ensure_luks_open
 fi
 
@@ -1018,20 +1064,36 @@ info "Mounting encrypted root..."
 mount "$ROOT_DEV" "$MOUNT_DST"
 CLEANUP_MOUNTS+=("$MOUNT_DST")
 
-if [ -z "$BACKUP_DIR" ] || [ ! -d "$BACKUP_DIR" ]; then
-  fail "BACKUP_DIR is not set or does not exist ('$BACKUP_DIR'). Use --backup-dir=<path> to specify."
-fi
+if [ "$SCENARIO" = "nvme_migrate" ] || [ "$SCENARIO" = "usb_migrate" ]; then
+  # Migrate: copy directly from live root to encrypted target
+  info "Copying live root filesystem to encrypted target..."
+  info "This may take a while depending on filesystem size..."
+  rsync -aHAXx --info=progress2 \
+    --exclude='/dev/*' --exclude='/proc/*' \
+    --exclude='/sys/*' --exclude='/tmp/*' --exclude='/run/*' \
+    --exclude='/mnt/*' --exclude='/media/*' \
+    / "${MOUNT_DST}/" || { RC=$?; [ "$RC" -eq 23 ] && warn "rsync reported non-critical xattr warnings (exit 23), continuing" || exit "$RC"; }
 
-info "Restoring filesystem from backup ($BACKUP_DIR)..."
-info "This may take a while..."
-rsync -aHAXx --info=progress2 "${BACKUP_DIR}/" "${MOUNT_DST}/"
+  RESTORED_COUNT=$(find "$MOUNT_DST" | wc -l)
+  SRC_COUNT=$(find / -xdev 2>/dev/null | wc -l)
+  info "Source file count (approx): $SRC_COUNT"
+  info "Copied file count: $RESTORED_COUNT"
+else
+  if [ -z "$BACKUP_DIR" ] || [ ! -d "$BACKUP_DIR" ]; then
+    fail "BACKUP_DIR is not set or does not exist ('$BACKUP_DIR'). Use --backup-dir=<path> to specify."
+  fi
 
-# Verify
-RESTORED_COUNT=$(find "$MOUNT_DST" | wc -l)
-info "Restored file count: $RESTORED_COUNT (backup had: $BACKUP_COUNT)"
+  info "Restoring filesystem from backup ($BACKUP_DIR)..."
+  info "This may take a while..."
+  rsync -aHAXx --info=progress2 "${BACKUP_DIR}/" "${MOUNT_DST}/"
 
-if [ "$RESTORED_COUNT" -lt "$((BACKUP_COUNT * BACKUP_VERIFY_PCT / 100))" ]; then
-  fail "Restore file count is suspiciously low. Something went wrong."
+  # Verify
+  RESTORED_COUNT=$(find "$MOUNT_DST" | wc -l)
+  info "Restored file count: $RESTORED_COUNT (backup had: $BACKUP_COUNT)"
+
+  if [ "$RESTORED_COUNT" -lt "$((BACKUP_COUNT * BACKUP_VERIFY_PCT / 100))" ]; then
+    fail "Restore file count is suspiciously low. Something went wrong."
+  fi
 fi
 
 ok "Filesystem restored"
@@ -1106,16 +1168,6 @@ elif [ "$BOARD_TYPE" = "armbian" ]; then
     info "Installed staged armbianEnv.txt"
   fi
 
-  # Recompile boot.scr if boot.cmd exists
-  if [ -f "$MOUNT_BOOT/boot.cmd" ]; then
-    if command -v mkimage &>/dev/null; then
-      mkimage -C none -A arm64 -T script -d "$MOUNT_BOOT/boot.cmd" "$MOUNT_BOOT/boot.scr"
-      info "Recompiled boot.scr from boot.cmd"
-    else
-      warn "mkimage not found — cannot recompile boot.scr"
-      warn "Install u-boot-tools if boot.scr needs updating"
-    fi
-  fi
 fi
 
 # Update crypttab in restored root (use UUID so initramfs can resolve the device in chroot)
@@ -1531,14 +1583,12 @@ elif [ "$BOARD_TYPE" = "armbian" ] && [ "$LOCAL_MODE" = true ]; then
   fi
   echo "  ${STEP}. Reboot and verify LUKS auto-unlock via clevis/tang"
   echo ""
-  warn "After successful ${STORAGE_TYPE} boot, disable eMMC boot:"
+  warn "After successful ${STORAGE_TYPE} boot, disable eMMC boot by clearing its bootable flag:"
   if [ -n "$SOURCE_DEVICE" ]; then
-    warn "  mount ${SOURCE_DEVICE}p1 /mnt"
+    warn "  parted ${SOURCE_DEVICE} set 1 boot off"
   else
-    warn "  mount /dev/mmcblk1p1 /mnt"
+    warn "  parted /dev/mmcblk1 set 1 boot off"
   fi
-  warn "  mv /mnt/boot/boot.scr /mnt/boot/boot.scr.disabled"
-  warn "  umount /mnt"
 
 elif [ "$BOARD_TYPE" = "armbian" ]; then
   echo -e "${YELLOW}Next steps:${NC}"

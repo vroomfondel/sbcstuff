@@ -46,7 +46,7 @@ Standalone scripts for LUKS-encrypting root partitions with clevis/tang auto-unl
 | Board | Boot mechanism | Boot partition | Boot config | Kernel postinst | SPI flash |
 |-------|---------------|----------------|-------------|-----------------|-----------|
 | Raspberry Pi | `/boot/firmware` (FAT32, separate partition) | Already separate | `cmdline.txt` + `config.txt` | Custom hook (initramfs-rebuild) | N/A |
-| Armbian/U-Boot (Rock 5B) | `/boot` (ext4, on root partition) | Must be split out | `armbianEnv.txt` + `boot.scr` | Armbian's own hooks | Auto-offered for RK3588 NVMe/USB migration |
+| Armbian/U-Boot (Rock 5B) | `/boot` (ext4, on root partition) | Must be split out | `armbianEnv.txt` | Armbian's own hooks | Auto-offered for RK3588 NVMe/USB migration |
 
 ### Supported Scenarios
 
@@ -89,7 +89,7 @@ partition → LUKS → /dev/mapper/rootfs (ext4)
 3. NVMe is partitioned automatically (1.5GB boot + rest for LUKS)
 4. Run `sudo ./luks_encrypt.sh` directly on the same board
    - On RK3588 boards: the script offers to flash U-Boot to SPI for NVMe boot
-5. Reboot, verify NVMe boot, then disable eMMC `boot.scr`
+5. Reboot, verify NVMe boot, then disable eMMC boot (`parted /dev/mmcblk1 set 1 boot off`)
 
 #### Armbian USB Migration (e.g., Rock 5B with USB SSD)
 
@@ -98,7 +98,7 @@ partition → LUKS → /dev/mapper/rootfs (ext4)
 3. USB SSD is partitioned automatically (1.5GB boot + rest for LUKS)
 4. Run `sudo ./luks_encrypt.sh` directly on the same board
    - On RK3588 boards: the script offers to flash U-Boot to SPI for USB boot
-5. Reboot, verify USB boot, then disable eMMC `boot.scr`
+5. Reboot, verify USB boot, then disable eMMC boot (`parted /dev/mmcblk1 set 1 boot off`)
 
 #### Armbian In-Place eMMC (on-board split)
 
@@ -129,7 +129,7 @@ Both scripts share the same configuration block at the top. **Values must match 
 
 | Variable | Default | Description |
 |---|---|---|
-| `TANG_SERVERS` | `("" "")` | Tang server URLs for clevis binding (prompted at runtime if empty) |
+| `TANG_SERVERS` | `("" "")` | Tang server URLs for clevis binding. `luks_prepare.sh` writes them to `luks.conf`; `luks_encrypt.sh` reads them from there (prompted at runtime only if still empty) |
 | `SSS_THRESHOLD` | `2` | Shamir's Secret Sharing threshold (number of tang servers required) |
 | `LUKS_MAPPER_NAME` | `rootfs` | LUKS device mapper name (`/dev/mapper/<name>`) |
 | `USE_LVM` | `true` | Enable LVM layer inside LUKS |
@@ -165,7 +165,7 @@ sudo ./luks_prepare.sh -h   # show help
     - Armbian: `armbianEnv.txt` with updated `rootdev=`
     - `crypttab` — maps LUKS device with `luks,initramfs` options
     - `fstab` — root and boot mounts updated for encrypted device paths
-    - `luks.conf` — board type, device paths, scenario (used by encrypt script)
+    - `luks.conf` — board type, device paths, scenario, tang server URLs (used by encrypt script)
     - `luks_encrypt.sh`, `tang_check_connection.sh`, `cleanup-netplan` — copies for deployment by encrypt script
 12. Rebuilds initramfs
 13. Tests tang server connectivity
@@ -286,7 +286,7 @@ sudo ./luks_encrypt.sh -h                                       # show help
 
 **Modes:**
 
-- **Local mode** (auto-detected when encrypt target != boot disk): backs up from live root via `rsync --exclude`, no cross-arch chroot needed, tang servers directly reachable
+- **Local mode** (auto-detected when encrypt target is the boot disk, or for NVMe/USB migration scenarios): copies directly from live root via `rsync --exclude` (no intermediate backup needed for migration), no cross-arch chroot needed, tang servers directly reachable
 - **External mode** (RPi default): mounts target root read-only for backup, may need `qemu-user-static` for cross-arch chroot
 
 **Device auto-detection:**
@@ -303,10 +303,10 @@ The script is organized into 8 resumable phases. Each phase is gated — when us
 | # | Phase | Description |
 |---|-------|-------------|
 | 1 | `detect` | Device detection, board type, confirmation |
-| 2 | `backup` | Root partition backup via rsync |
+| 2 | `backup` | Root partition backup via rsync (skipped for NVMe/USB migration — data is copied directly in restore phase) |
 | 3 | `encrypt` | Stale device cleanup, `wipefs`, LUKS2 format + open with user-provided passphrase |
 | 4 | `restore` | Create filesystem (+ LVM if enabled), rsync restore, file count verification |
-| 5 | `bootconfig` | Board-specific boot config: RPi (`cmdline.txt` + `config.txt`), Armbian (`armbianEnv.txt` + `boot.scr`), both (`/etc/crypttab`, `/etc/fstab`, `cleanup-netplan` hook, `tang_check_connection.sh`) |
+| 5 | `bootconfig` | Board-specific boot config: RPi (`cmdline.txt` + `config.txt`), Armbian (`armbianEnv.txt`), both (`/etc/crypttab`, `/etc/fstab`, `cleanup-netplan` hook, `tang_check_connection.sh`) |
 | 6 | `initramfs` | Chroot + `update-initramfs`; Armbian also ensures `uInitrd` (U-Boot wrapped) via `mkimage` |
 | 7 | `clevis` | Clevis/Tang SSS binding (prompts for LUKS passphrase if not already available) |
 | 8 | `verify` | Verification (clevis bindings, initramfs hooks), cleanup, SPI U-Boot flash (RK3588 NVMe/USB migration) |
@@ -341,7 +341,7 @@ Skips all encryption steps and runs only the SPI U-Boot flash for NVMe/USB boot.
 **Prerequisites:**
 
 - `cryptsetup`, `clevis`, `clevis-luks`, `rsync`, `curl`, `jq`, `mkfs.ext4`, `wipefs`
-- `mkimage` (from `u-boot-tools` — required for Armbian `boot.scr` recompile and `uInitrd` creation)
+- `mkimage` (from `u-boot-tools` — required for Armbian `uInitrd` creation)
 - `lvm2` (if `USE_LVM=true`)
 - `qemu-user-static` (only if external mode host is not aarch64)
 
@@ -450,18 +450,10 @@ initramfs-tools `run_scripts()` sources the ORDER file, which calls scripts as s
 **`luks_boot_split.sh`: external mode device not detected:**
 The auto-detection looks for devices with `usb` or `mmc` transport, plus `sd*` devices with existing partitions. If your card reader is not detected, specify the device explicitly: `sudo ./luks_boot_split.sh --external /dev/sdX`.
 
-**Armbian: boot.scr not updated:**
-If `mkimage` is not installed, the script warns but continues. Install `u-boot-tools` and recompile manually:
-```bash
-mkimage -C none -A arm64 -T script -d /boot/boot.cmd /boot/boot.scr
-```
-
 **RK3588: Board still boots from eMMC/SD after SPI flash:**
-U-Boot scans eMMC/SD before NVMe/USB. Disable the old boot:
+U-Boot scans eMMC/SD before NVMe/USB. Disable the old boot by clearing the bootable flag:
 ```bash
-mount /dev/mmcblk1p1 /mnt          # or mmcblk0p1, depending on the board
-mv /mnt/boot/boot.scr /mnt/boot/boot.scr.disabled
-umount /mnt
+parted /dev/mmcblk1 set 1 boot off    # or mmcblk0, depending on the board
 ```
 Or remove the SD card physically if that's the boot source.
 
@@ -662,6 +654,34 @@ This project is licensed under the LGPL where applicable/possible — see [LICEN
 ## Acknowledgments
 - Inspirations and snippets are referenced in code comments where appropriate.
 
+
+## Screenshots — LUKS Encryption on Rock 5B (NVMe Migration)
+
+Full run of `luks_encrypt.sh` on a Rock 5B with NVMe migration, LUKS2 + LVM + clevis/tang auto-unlock. Sensitive data (hostnames, tang URLs, UUIDs) redacted with `blurimage.py`.
+
+### Encryption start — device detection and backup
+
+![luks_encrypt.sh — device detection, config readout, backup phase](Bildschirmfoto_2026-02-14_19-57-42_blurred.png)
+
+### Phases 4–8 — restore, bootconfig, initramfs, clevis, verify
+
+![luks_encrypt.sh — restore, boot config, initramfs rebuild, clevis binding, SPI flash](Bildschirmfoto_2026-02-14_19-57-07_blurred.png)
+
+### Completion — clevis binding, SPI flash, post-run summary
+
+![luks_encrypt.sh — clevis/tang SSS binding, SPI U-Boot flash, next steps](Bildschirmfoto_2026-02-14_20-02-22_blurred.png)
+
+### Post-boot verification — lsblk, LVM, storage stack
+
+![Post-boot: lsblk showing NVMe with LUKS + LVM, pvs/vgs/lvs output](Bildschirmfoto_2026-02-14_20-09-57_blurred.png)
+
+### LUKS header and keyslot details
+
+![cryptsetup luksDump — LUKS2 header, keyslots, segments](Bildschirmfoto_2026-02-14_20-13-06_blurred.png)
+
+![cryptsetup luksDump — keyslot digests and token details](Bildschirmfoto_2026-02-14_20-13-28_blurred.png)
+
+---
 
 ## ⚠️ Note
 

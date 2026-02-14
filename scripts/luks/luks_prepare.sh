@@ -760,6 +760,8 @@ PI_BOOT_PART="${BOOT_PART}"
 PI_ROOT_PART="${ROOT_PART}"
 SOURCE_DEVICE="${CURRENT_ROOT_DISK:-}"
 SCENARIO="${SCENARIO}"
+TANG_SERVER_1="${TANG_SERVERS[0]}"
+TANG_SERVER_2="${TANG_SERVERS[1]}"
 EOF
 info "  Staged luks.conf (BOARD_TYPE=${BOARD_TYPE}, DEVICE=${DEVICE})"
 
@@ -902,10 +904,8 @@ elif [ "$SCENARIO" = "nvme_migrate" ] || [ "$SCENARIO" = "usb_migrate" ]; then
   echo ""
   echo "  After encryption and reboot:"
   echo "    1. Verify LUKS auto-unlock via clevis/tang"
-  echo "    2. Disable old eMMC boot:"
-  echo "       mount ${CURRENT_ROOT_DISK}p1 /mnt"
-  echo "       mv /mnt/boot/boot.scr /mnt/boot/boot.scr.disabled"
-  echo "       umount /mnt"
+  echo "    2. Disable old eMMC boot by clearing its bootable flag:"
+  echo "       parted ${CURRENT_ROOT_DISK} set 1 boot off"
 
 elif [ "$SCENARIO" = "inplace" ]; then
   echo -e "${YELLOW}Next steps:${NC}"

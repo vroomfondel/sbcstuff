@@ -629,19 +629,18 @@ sudo ./scripts/luks/luks_prepare.sh
 
 # 2. Encrypt: directly on the Rock 5B (local mode, NVMe ≠ boot disk)
 sudo ./scripts/luks/luks_encrypt.sh
-# → Auto-detects local mode (NVMe != eMMC)
-# → Backup from running root via rsync
+# → Auto-detects local mode (migration scenario)
+# → Copies directly from running root to encrypted NVMe (no intermediate backup)
 # → NVMe p2 LUKS-encrypted, LVM created, data restored
-# → armbianEnv.txt on NVMe p1 updated, boot.scr recompiled
+# → armbianEnv.txt on NVMe p1 updated
 # → Initramfs rebuilt in chroot + uInitrd created
 # → Clevis/Tang bound
+# → No intermediate backup needed — data is copied directly from live root to encrypted NVMe
 
-# 3. Reboot, U-Boot finds NVMe boot.scr, Clevis decrypts automatically
+# 3. Reboot, U-Boot finds NVMe, Clevis decrypts automatically
 
 # 4. After successful NVMe boot: disable eMMC boot
-mount /dev/mmcblk1p1 /mnt
-mv /mnt/boot/boot.scr /mnt/boot/boot.scr.disabled
-umount /mnt
+parted /dev/mmcblk1 set 1 boot off
 ```
 
 ### Storage Stack After Migration
@@ -657,7 +656,7 @@ umount /mnt
 |--------|-----|-------------------|
 | Board detection | `/boot/firmware/config.txt` | `/boot/armbianEnv.txt` |
 | Boot directory | `/boot/firmware` (vfat) | `/boot` (ext4) |
-| Boot config | `cmdline.txt` + `config.txt` | `armbianEnv.txt` + `boot.scr` |
+| Boot config | `cmdline.txt` + `config.txt` | `armbianEnv.txt` |
 | Root device param | `root=` + `cryptdevice=` in cmdline | `rootdev=` in armbianEnv.txt |
 | Kernel postinst | Custom initramfs-rebuild hook | Skip (Armbian's own hooks) |
 | Initramfs format | `initramfs.gz` | `initrd.img-*` + `uInitrd-*` (mkimage wrapped) |
@@ -670,7 +669,7 @@ umount /mnt
 # Required on the Rock 5B (installed by luks_prepare.sh):
 apt install cryptsetup cryptsetup-initramfs clevis clevis-luks clevis-initramfs clevis-systemd curl jq lvm2
 
-# For boot.scr recompile and uInitrd creation:
+# For uInitrd creation:
 apt install u-boot-tools
 ```
 

@@ -50,7 +50,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-    from typing import TypedDict
+    from typing import NotRequired, TypedDict
 
     import numpy
     from tensorflow.lite.python.interpreter import Interpreter as _TFInterpreter
@@ -64,6 +64,8 @@ if TYPE_CHECKING:
         num_runs: int
         output_shape: tuple[int, ...]
         output_sample: list[float]
+        npu_total_nodes: NotRequired[int]
+        npu_op_counts: NotRequired[dict[str, int]]
 
     class SystemInfo(TypedDict):
         kernel_ok: bool
@@ -599,10 +601,15 @@ def _npu_worker(
     input_dtype: str,
     num_runs: int,
     result_file: str,
+    trace: bool = False,
 ) -> None:
     """Child process: run NPU inference and write results to a temp file."""
     import json
     import numpy as np
+
+    if trace:
+        os.environ["TF_CPP_MIN_LOG_LEVEL"] = "0"
+        os.environ["MESA_DEBUG"] = "1"
 
     Interpreter, load_delegate = load_tflite_runtime()
     input_data = np.frombuffer(input_bytes, dtype=input_dtype).reshape(input_shape)
@@ -613,16 +620,31 @@ def _npu_worker(
         experimental_delegates=[delegate],
     )
     npu_interp.allocate_tensors()
+
+    # Trace: collect node partition info
+    trace_info: dict[str, object] = {}
+    if trace:
+        try:
+            ops = npu_interp._get_ops_details()  # noqa: SLF001
+            op_counts: dict[str, int] = {}
+            for op in ops:
+                name = op.get("op_name", "unknown")
+                op_counts[name] = op_counts.get(name, 0) + 1
+            trace_info["npu_total_nodes"] = len(ops)
+            trace_info["npu_op_counts"] = op_counts
+        except AttributeError:
+            pass
+
     result = benchmark_inference(npu_interp, input_data, num_warmup=NPU_WARMUP_RUNS, num_runs=num_runs)
     # numpy types are not JSON-serializable — convert for json.dump
-    serializable: dict[str, object] = {**result, "output_shape": list(result["output_shape"])}
+    serializable: dict[str, object] = {**result, "output_shape": list(result["output_shape"]), **trace_info}
 
     with open(result_file, "w") as f:
         json.dump(serializable, f)
 
 
 def _run_npu_benchmark_isolated(
-    model_path: Path, teflon_path: str, input_data: numpy.ndarray, num_runs: int
+    model_path: Path, teflon_path: str, input_data: numpy.ndarray, num_runs: int, *, trace: bool = False
 ) -> BenchmarkResult | None:
     """Run NPU benchmark in a child process to survive driver crashes."""
     import json
@@ -643,6 +665,7 @@ def _run_npu_benchmark_isolated(
                 str(input_data.dtype),
                 num_runs,
                 result_file,
+                trace,
             ),
         )
         proc.start()
@@ -678,7 +701,28 @@ def _run_npu_benchmark_isolated(
         Path(result_file).unlink(missing_ok=True)
 
 
-def run_inference_test(model_path: Path, sys_info: SystemInfo) -> None:
+def _trace_node_details(interpreter: _TFInterpreter, label: str) -> int:
+    """Print op node details for tracing. Returns total node count."""
+    try:
+        # _get_ops_details() is an internal TFLite API but stable across versions
+        ops = interpreter._get_ops_details()  # noqa: SLF001
+    except AttributeError:
+        warn(f"  [{label}] _get_ops_details() nicht verfügbar — Trace übersprungen")
+        return 0
+
+    op_counts: dict[str, int] = {}
+    for op in ops:
+        name = op.get("op_name", "unknown")
+        op_counts[name] = op_counts.get(name, 0) + 1
+
+    total = len(ops)
+    info(f"  [{label}] {total} Nodes:")
+    for name, count in sorted(op_counts.items(), key=lambda x: -x[1]):
+        info(f"    {name}: {count}")
+    return total
+
+
+def run_inference_test(model_path: Path, sys_info: SystemInfo, *, trace: bool = False) -> None:
     """Run CPU and (if available) NPU inference and compare results."""
     import numpy as np
 
@@ -693,6 +737,11 @@ def run_inference_test(model_path: Path, sys_info: SystemInfo) -> None:
     info("Starting CPU benchmark (XNNPACK) ...")
     cpu_interp = Interpreter(model_path=str(model_path), num_threads=CPU_NUM_THREADS)
     cpu_interp.allocate_tensors()
+
+    cpu_total_nodes = 0
+    if trace:
+        header("Trace: Op-Partitionierung")
+        cpu_total_nodes = _trace_node_details(cpu_interp, "CPU")
 
     input_data = create_test_input(cpu_interp.get_input_details())
     cpu_result = benchmark_inference(cpu_interp, input_data, num_warmup=CPU_WARMUP_RUNS, num_runs=num_runs)
@@ -709,13 +758,30 @@ def run_inference_test(model_path: Path, sys_info: SystemInfo) -> None:
 
     if teflon_path:
         info("Starting NPU benchmark (Teflon delegate) ...")
-        npu_result = _run_npu_benchmark_isolated(model_path, teflon_path, input_data, num_runs)
+        npu_result = _run_npu_benchmark_isolated(model_path, teflon_path, input_data, num_runs, trace=trace)
         if npu_result:
             ok(
                 f"NPU:  {npu_result['mean_ms']:.1f} ms ± {npu_result['std_ms']:.1f} ms  "
                 f"(median {npu_result['median_ms']:.1f} ms, min {npu_result['min_ms']:.1f} ms, "
                 f"n={npu_result['num_runs']})"
             )
+        if trace and npu_result:
+            npu_node_count = npu_result.get("npu_total_nodes", 0)
+            npu_op_counts = npu_result.get("npu_op_counts", {})
+            if npu_op_counts:
+                info(f"  [NPU+Delegate] {npu_node_count} Nodes:")
+                for name, count in sorted(npu_op_counts.items(), key=lambda x: -x[1]):
+                    info(f"    {name}: {count}")
+                # Count delegated vs CPU-fallback nodes
+                delegated = sum(c for n, c in npu_op_counts.items() if "delegate" in n.lower() or "teflon" in n.lower())
+                cpu_fallback = npu_node_count - delegated
+                if delegated > 0:
+                    info(f"  → {delegated} delegierte Node(s) (NPU), {cpu_fallback} CPU-Fallback Node(s)")
+                    if cpu_total_nodes > 0:
+                        pct = delegated / cpu_total_nodes * 100
+                        info(f"  → {pct:.0f}% der Original-Ops wurden zu {delegated} Delegate-Node(s) zusammengefasst")
+                else:
+                    warn("  Keine Delegate-Nodes erkannt — möglicherweise läuft alles auf CPU")
     else:
         warn("Teflon delegate not available — skipping NPU benchmark")
         info("Only CPU results available")
@@ -760,6 +826,11 @@ def main() -> None:
         help="System check only, no inference",
     )
     parser.add_argument(
+        "--trace",
+        action="store_true",
+        help="Zeige Delegate-Trace: Op-Partitionierung (NPU vs CPU), Mesa/Teflon Debug-Output",
+    )
+    parser.add_argument(
         "--model",
         type=Path,
         help="Pfad zu einem eigenen .tflite Model",
@@ -792,7 +863,7 @@ def main() -> None:
     else:
         model_path = download_model(args.preset)
 
-    run_inference_test(model_path, sys_info)
+    run_inference_test(model_path, sys_info, trace=args.trace)
 
 
 if __name__ == "__main__":
