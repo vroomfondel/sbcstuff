@@ -7,7 +7,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Collection of standalone shell scripts and a Python test tool for aarch64 SBC (Single Board Computer) administration. Two main areas:
 
 1. **LUKS encryption scripts** — Full-disk encryption with clevis/tang (NBDE) for Raspberry Pi and Armbian boards (Rock 5B / RK3588). Three-script workflow: `luks_boot_split.sh` → `luks_prepare.sh` → `luks_encrypt.sh`.
-2. **Rock 5B hardware tools** — Diagnostics (`rock5b-hw-check.sh`), USB boot setup (`rock5b-usb-boot-setup.sh`), and NPU benchmarking (`rock5b-npu-test.py`).
+2. **Rock 5B hardware tools** — Diagnostics (`rock5b-hw-check.sh`), USB boot setup (`rock5b-usb-boot-setup.sh`), NPU benchmarking (`rock5b-npu-test.py`), and Mesa/Teflon NPU driver build (`build-mesa-teflon.sh`).
+3. **Image redaction tool** — `repo_scripts/blurimage.py`: OCR-based screenshot redaction using pytesseract/OpenCV. Multi-pass OCR (weighted, max-channel, blue-channel grayscale), OTSU thresholding, word+line level matching. German output.
 
 Scripts are organized under `scripts/luks/` (LUKS encryption) and `scripts/rock5b/` (Rock 5B hardware tools). Repository automation lives in `repo_scripts/`.
 
@@ -46,8 +47,8 @@ Scripts detect the board type by checking for config files:
 
 - All shell scripts use `set -euo pipefail` and colored output helpers (`info`, `ok`, `warn`, `fail`).
 - Scripts are designed to run as root (`sudo`).
-- The Python script (`rock5b-npu-test.py`) uses German-language output strings (consistent with `rock5b-hw-check.sh` and `rock5b-usb-boot-setup.sh`). `README_ROCKCHIP_5b.md` is also in German.
-- `luks_prepare.sh` and `luks_encrypt.sh` use English output strings and English README documentation.
+- **German output**: `rock5b-npu-test.py`, `rock5b-hw-check.sh`, `rock5b-usb-boot-setup.sh`, `blurimage.py`, `update_badge.py`. `README_ROCKCHIP_5b.md` is also in German.
+- **English output**: `luks_prepare.sh`, `luks_encrypt.sh`, and their README documentation.
 
 ## Rock 5B NPU context
 
@@ -68,13 +69,27 @@ make tests            # Run pytest
 make lint             # Format with black (line-length 120)
 make isort            # Sort imports
 make tcheck           # Static type checks with mypy
+make gitleaks         # Run gitleaks pre-commit hook only
 make commit-checks    # Run all pre-commit hooks (black, mypy, gitleaks)
 make prepare          # tests + commit-checks
-make teflon-fetch     # rsync libteflon.so build artifacts from Rock 5B
+make teflon-fetch     # rsync libteflon.so build artifacts from Rock 5B (ROCK5B_HOST=root@rock5b)
 make teflon-release   # teflon-fetch + create GitHub Release
 ```
 
-Pre-commit hooks: black (check + diff mode), mypy, gitleaks. Config in `.pre-commit-config.yaml`.
+Run a single test:
+```bash
+pytest tests/test_blurimage.py::TestBlurimageArgparse::test_image_before_blur -v
+```
+
+Pre-commit hooks: black (check + diff mode), mypy, gitleaks. Config in `.pre-commit-config.yaml`. Hooks use `fail_fast: true`.
+
+## Python conventions
+
+- **Strict mypy**: `disallow_untyped_defs`, `disallow_incomplete_defs`, `no_implicit_optional`. Tests are excluded from mypy.
+- **TYPE_CHECKING guards**: Use `from __future__ import annotations` and `if TYPE_CHECKING:` for imports only needed by mypy (avoids runtime dependency on type stubs).
+- **Auto-install pattern**: Some scripts (`blurimage.py`, `update_badge.py`) use an `install_and_import()` helper to pip-install missing packages at runtime.
+- **asyncio_mode = "auto"**: Pytest auto-detects async tests, no need for `@pytest.mark.asyncio`.
+- **`*.local.*` files are gitignored** — used for credentials and unredacted screenshots. Never commit these.
 
 ## repo_scripts/
 
@@ -82,5 +97,14 @@ Repository automation for CI container builds and DockerHub integration:
 
 - **`build-container-multiarch.sh`** — Builds multi-arch (amd64/arm64) container image using podman. Image: `xomoxcc/sbcstuff:python-3.14-slim-trixie`.
 - **`initial_setup_github_dockerhub.sh`** — One-time setup: creates DockerHub repo, configures GitHub secrets, sets up pre-commit hooks.
-- **`check_dockerhub_token.py`** / **`dh_login.py`** / **`update_badge.py`** — DockerHub token validation, login, and README badge updates.
-- **`include.sh`** / **`include.local.sh`** — Shared config. `*.local.*` files are gitignored for credentials.
+- **`check_dockerhub_token.py`** — Validates DockerHub token scopes (pull/push/delete). JSON and ASCII table output.
+- **`dh_login.py`** — DockerHub login with MFA/TOTP support. Env vars: `DOCKERHUB_ADMIN_USER`, `DOCKERHUB_ADMIN_PASSWORD`, `DOCKERHUB_TOTP_SECRET`.
+- **`update_badge.py`** — Updates GitHub clone count badge via Gist + shields.io. Merges 14-day API window with historical data.
+- **`include.sh`** / **`include.local.sh`** — Shared config loader. `include.sh` searches multiple paths for `include.local.sh`. `*.local.*` files are gitignored for credentials.
+
+## CI/CD
+
+Three GitHub workflows (`.github/workflows/`):
+- **checkblack.yml** — Black lint check on push/PR.
+- **mypynpytests.yml** — mypy + pytest on push/PR. Uses `make tcheck` and `pytest .`.
+- **update-clone-badge.yml** — Scheduled (3x daily) clone count badge update via `update_badge.py`. Requires secrets: `GIST_TOKEN`, `GIST_ID`, `REPO_PRIV_TOKEN`.
