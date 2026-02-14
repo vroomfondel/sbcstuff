@@ -212,8 +212,12 @@ MODEL_PRESETS = {
         "desc": "SSD MobileNet v2 Object Detection (~6.5 MB, hoher Rechenaufwand)",
     },
     "xlarge": {
-        "file": "inception_v4_299_quant.tflite",
-        "desc": "Inception v4 (~41 MB, sehr hoher Rechenaufwand)",
+        "file": "inception_v1_224_quant.tflite",
+        "desc": "Inception v1 (~6.4 MB, hoher Rechenaufwand)",
+    },
+    "xxlarge": {
+        "file": "inception_v2_224_quant.tflite",
+        "desc": "Inception v2 (~11 MB, sehr hoher Rechenaufwand)",
     },
 }
 DEFAULT_MODEL_PRESET = "large"
