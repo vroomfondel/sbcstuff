@@ -151,7 +151,8 @@ import pytesseract
 from pytesseract import Output
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
+    """Build and return the argument parser for blurimage."""
     parser = argparse.ArgumentParser(
         description="Blur sensitive text in an image using OCR detection. See module docstring for full documentation.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -176,6 +177,11 @@ def main() -> None:
     parser.add_argument("--scale", type=int, default=2, help="Upscale factor before OCR (default: 2, 1=off)")
     parser.add_argument("--debug", action="store_true", help="Print all OCR-detected lines before blurring")
     parser.add_argument("image", help="Path to input image")
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
     args = parser.parse_args()
 
     if not args.blur and not args.blur_regex:
