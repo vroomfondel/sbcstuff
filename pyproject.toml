@@ -1,0 +1,66 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sbcstuff"
+version = "0.0.1"
+description = "Shell scripts and Python tools for aarch64 SBC administration (LUKS encryption, Rock 5B diagnostics, Raspberry Pi)"
+readme = "README.md"
+requires-python = ">=3.14"
+license = "LGPL-3.0-or-later"
+authors = [
+  { name = "Henning Thieß", email = "ht@xomox.cc" },
+]
+
+keywords = [
+    "sbc",
+    "raspberry-pi",
+    "rock5b",
+    "luks",
+    "encryption",
+    "armbian",
+    "aarch64",
+    "npu",
+]
+
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: System :: Hardware",
+    "Topic :: System :: Systems Administration",
+    "License :: OSI Approved :: GNU Lesser General Public License v3 or later (LGPLv3+)",
+    "Operating System :: POSIX :: Linux",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["scripts"]
+
+[tool.black]
+line-length = 120
+
+[tool.isort]
+profile = "black"
+line_length = 120
+
+[tool.mypy]
+warn_return_any = false
+warn_unused_configs = true
+ignore_missing_imports = true
+follow_imports = "silent"
+check_untyped_defs = true
+disallow_incomplete_defs = true
+disallow_untyped_defs = true
+no_implicit_optional = true
+exclude = '''(?x)(
+    \.venv
+    | tests
+    | venv
+    | \.pyi$
+    | _test\.py$
+    | \.local\.py$
+)'''
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
