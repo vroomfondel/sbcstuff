@@ -17,6 +17,9 @@ sys.modules.setdefault("pytesseract", _mock_pytesseract)
 _mock_cv2: types.ModuleType = types.ModuleType("cv2")
 sys.modules.setdefault("cv2", _mock_cv2)
 
+_mock_numpy: types.ModuleType = types.ModuleType("numpy")
+sys.modules.setdefault("numpy", _mock_numpy)
+
 with patch("shutil.which", return_value="/usr/bin/tesseract"):
     from repo_scripts.blurimage import build_parser
 
