@@ -9,6 +9,8 @@ Usage:
     python3 rock5b-npu-test.py --preset small        # Small model (MobileNet v2)
     python3 rock5b-npu-test.py --preset xlarge       # Extra large (Inception v4)
     python3 rock5b-npu-test.py --check-only          # System check only, no inference
+    python3 rock5b-npu-test.py --check-int8           # Check if model is fully INT8 quantized
+    python3 rock5b-npu-test.py --convert-int8 /path/to/saved_model  # Convert float model to INT8
     python3 rock5b-npu-test.py --model /path/to.tflite  # Custom model
 
 Rocket stack:
@@ -50,7 +52,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-    from typing import NotRequired, TypedDict
+    from typing import TypedDict
 
     import numpy
     from tensorflow.lite.python.interpreter import Interpreter as _TFInterpreter
@@ -64,8 +66,6 @@ if TYPE_CHECKING:
         num_runs: int
         output_shape: tuple[int, ...]
         output_sample: list[float]
-        npu_total_nodes: NotRequired[int]
-        npu_op_counts: NotRequired[dict[str, int]]
 
     class SystemInfo(TypedDict):
         kernel_ok: bool
@@ -198,7 +198,9 @@ def header(msg: str) -> None:
 
 
 # -- Configuration -------------------------------------------------------------
-# Model presets (all INT8 quantized .tflite from google-coral/test_data)
+# Model presets (quantized .tflite from google-coral/test_data)
+# Hinweis: Nicht alle Tensoren sind INT8 — einige Ops (z.B. Detection PostProcess,
+# DEQUANTIZE, LOGISTIC) bleiben float32. Prüfung: --check-int8
 CORAL_BASE_URL = "https://raw.githubusercontent.com/google-coral/test_data/master"
 MODEL_PRESETS = {
     "small": {
@@ -537,6 +539,116 @@ def load_tflite_runtime() -> tuple[type[_TFInterpreter], Callable[[str], object]
     sys.exit(1)
 
 
+def check_model_int8(model_path: Path) -> bool:
+    """Prüfe ob ein TFLite-Model vollständig INT8-quantisiert ist."""
+    import numpy as np
+
+    Interpreter, _ = load_tflite_runtime()
+    interpreter = Interpreter(model_path=str(model_path))
+    interpreter.allocate_tensors()
+
+    input_details = interpreter.get_input_details()
+    output_details = interpreter.get_output_details()
+
+    input_dtype = input_details[0]["dtype"]
+    output_dtype = output_details[0]["dtype"]
+
+    info(f"Input-Typ:  {input_dtype.__name__}")
+    info(f"Output-Typ: {output_dtype.__name__}")
+
+    tensor_details = interpreter.get_tensor_details()
+    float_ops = [t for t in tensor_details if t["dtype"] == np.float32]
+
+    if not float_ops:
+        ok("Model ist vollständig INT8-quantisiert")
+        return True
+
+    warn(f"{len(float_ops)} von {len(tensor_details)} Tensoren sind float32 (nicht INT8)")
+    info("Rocket/Teflon NPU benötigt vollständig INT8-quantisierte Models")
+    return False
+
+
+def convert_model_int8(source: Path, output: Path, *, num_calibration: int = 100) -> Path:
+    """Konvertiere ein Float-Model (SavedModel oder .tflite) zu vollständig INT8-quantisiert.
+
+    Verwendet representative_dataset mit Zufallsdaten zur Kalibrierung.
+    Erzwingt INT8 für Input/Output (Voraussetzung für Rocket NPU).
+    """
+    import tensorflow as tf
+
+    info(f"Lade Quell-Model: {source}")
+
+    if source.is_dir():
+        # TensorFlow SavedModel directory
+        converter = tf.lite.TFLiteConverter.from_saved_model(str(source))
+    elif source.suffix == ".tflite":
+        # .tflite enthält nur den optimierten Graphen, nicht den Original-Graphen —
+        # TFLiteConverter kann daraus nicht re-quantisieren.
+        fail("Bereits konvertierte .tflite-Dateien können nicht re-quantisiert werden")
+        info("TFLiteConverter benötigt den Original-Graphen (SavedModel, .h5 oder .keras)")
+        info(f"Quantisierung prüfen: --check-int8 --model {source}")
+        sys.exit(1)
+    elif source.suffix in (".h5", ".keras"):
+        model = tf.keras.models.load_model(str(source))
+        converter = tf.lite.TFLiteConverter.from_keras_model(model)
+    else:
+        fail(f"Unbekanntes Format: {source.suffix}")
+        info("Unterstützt: SavedModel-Verzeichnis, .h5, .keras")
+        sys.exit(1)
+
+    # Determine input shape from converter
+    # For representative dataset we need the input shape — get it after conversion setup
+    try:
+        # Try getting shape from the converter's input tensors
+        tf_func = converter._funcs[0]  # noqa: SLF001
+        input_shape = tuple(tf_func.inputs[0].shape)
+        if any(d is None for d in input_shape):
+            # Replace None (batch) with 1
+            input_shape = tuple(1 if d is None else d for d in input_shape)
+    except Exception:
+        # Fallback: common image input shape
+        input_shape = (1, 224, 224, 3)
+        warn(f"Input-Shape nicht ermittelbar — verwende Fallback {input_shape}")
+
+    import numpy as np
+
+    info(f"Kalibrierung mit {num_calibration} Zufalls-Samples (Shape: {input_shape}) ...")
+    warn("Zufallsdaten dienen nur als Fallback-Kalibrierung")
+    info("Für präzisere Quantisierung echte Eingabedaten verwenden (z.B. Bilder)")
+
+    # Kalibrierungsdaten: Der Converter misst die Wertebereiche (min/max) jedes Tensors,
+    # um daraus INT8-Quantisierungsparameter (Scale + Zero-Point) zu berechnen.
+    # Zufallsdaten liefern brauchbare, aber nicht optimale Ergebnisse —
+    # mit echten, repräsentativen Daten wäre die Quantisierung genauer.
+    def representative_data_gen() -> object:
+        for _ in range(num_calibration):
+            data = np.random.rand(*input_shape).astype(np.float32)
+            yield [data]
+
+    converter.representative_dataset = representative_data_gen
+    converter.optimizations = [tf.lite.Optimize.DEFAULT]
+    converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+    converter.inference_input_type = tf.int8
+    converter.inference_output_type = tf.int8
+
+    info("Konvertiere zu INT8 ...")
+    tflite_model = converter.convert()
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_bytes(tflite_model)
+    size_mb = len(tflite_model) / (1024 * 1024)
+    ok(f"INT8-Model gespeichert: {output} ({size_mb:.1f} MB)")
+
+    # Verify result
+    header("Verifizierung")
+    is_int8 = check_model_int8(output)
+    if not is_int8:
+        warn("Konvertierung hat nicht alle Tensoren zu INT8 konvertiert")
+        info("Einige Ops haben möglicherweise keine INT8-Implementierung")
+
+    return output
+
+
 def create_test_input(input_details: list[dict[str, object]]) -> numpy.ndarray:
     """Create a random test input matching the model's expected shape."""
     import numpy as np
@@ -601,15 +713,10 @@ def _npu_worker(
     input_dtype: str,
     num_runs: int,
     result_file: str,
-    trace: bool = False,
 ) -> None:
     """Child process: run NPU inference and write results to a temp file."""
     import json
     import numpy as np
-
-    if trace:
-        os.environ["TF_CPP_MIN_LOG_LEVEL"] = "0"
-        os.environ["MESA_DEBUG"] = "1"
 
     Interpreter, load_delegate = load_tflite_runtime()
     input_data = np.frombuffer(input_bytes, dtype=input_dtype).reshape(input_shape)
@@ -621,30 +728,16 @@ def _npu_worker(
     )
     npu_interp.allocate_tensors()
 
-    # Trace: collect node partition info
-    trace_info: dict[str, object] = {}
-    if trace:
-        try:
-            ops = npu_interp._get_ops_details()  # noqa: SLF001
-            op_counts: dict[str, int] = {}
-            for op in ops:
-                name = op.get("op_name", "unknown")
-                op_counts[name] = op_counts.get(name, 0) + 1
-            trace_info["npu_total_nodes"] = len(ops)
-            trace_info["npu_op_counts"] = op_counts
-        except AttributeError:
-            pass
-
     result = benchmark_inference(npu_interp, input_data, num_warmup=NPU_WARMUP_RUNS, num_runs=num_runs)
     # numpy types are not JSON-serializable — convert for json.dump
-    serializable: dict[str, object] = {**result, "output_shape": list(result["output_shape"]), **trace_info}
+    serializable: dict[str, object] = {**result, "output_shape": list(result["output_shape"])}
 
     with open(result_file, "w") as f:
         json.dump(serializable, f)
 
 
 def _run_npu_benchmark_isolated(
-    model_path: Path, teflon_path: str, input_data: numpy.ndarray, num_runs: int, *, trace: bool = False
+    model_path: Path, teflon_path: str, input_data: numpy.ndarray, num_runs: int
 ) -> BenchmarkResult | None:
     """Run NPU benchmark in a child process to survive driver crashes."""
     import json
@@ -665,7 +758,6 @@ def _run_npu_benchmark_isolated(
                 str(input_data.dtype),
                 num_runs,
                 result_file,
-                trace,
             ),
         )
         proc.start()
@@ -701,25 +793,80 @@ def _run_npu_benchmark_isolated(
         Path(result_file).unlink(missing_ok=True)
 
 
-def _trace_node_details(interpreter: _TFInterpreter, label: str) -> int:
-    """Print op node details for tracing. Returns total node count."""
+def _run_benchmark_model_profiling(model_path: Path, teflon_path: str) -> str | None:
+    """Run benchmark_model with op profiling and return stdout, or None if not available."""
+    benchmark_bin = shutil.which("benchmark_model")
+    if not benchmark_bin:
+        return None
+
+    env = {**os.environ, "TEFLON_DEBUG": "1", "ROCKET_DEBUG": "1"}
     try:
-        # _get_ops_details() is an internal TFLite API but stable across versions
-        ops = interpreter._get_ops_details()  # noqa: SLF001
-    except AttributeError:
-        warn(f"  [{label}] _get_ops_details() nicht verfügbar — Trace übersprungen")
-        return 0
+        result = subprocess.run(
+            [
+                benchmark_bin,
+                f"--graph={model_path}",
+                f"--external_delegate_path={teflon_path}",
+                "--enable_op_profiling=true",
+                "--num_runs=20",
+                "--warmup_runs=5",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=SUBPROCESS_TIMEOUT * 2,
+            env=env,
+        )
+        return result.stdout + result.stderr
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+        warn(f"benchmark_model fehlgeschlagen: {e}")
+        return None
 
-    op_counts: dict[str, int] = {}
-    for op in ops:
-        name = op.get("op_name", "unknown")
-        op_counts[name] = op_counts.get(name, 0) + 1
 
-    total = len(ops)
-    info(f"  [{label}] {total} Nodes:")
-    for name, count in sorted(op_counts.items(), key=lambda x: -x[1]):
-        info(f"    {name}: {count}")
-    return total
+def _parse_benchmark_profile(output: str) -> list[dict[str, str]]:
+    """Parse the 'Run Order' table from benchmark_model output.
+
+    Returns list of dicts with keys: node_type, avg_ms, pct, name.
+    """
+    rows: list[dict[str, str]] = []
+    in_run_order = False
+    header_seen = False
+
+    for line in output.splitlines():
+        # Look for the "Operator-wise" Run Order section
+        if "Operator-wise Profiling" in line:
+            in_run_order = True
+            header_seen = False
+            continue
+        if in_run_order and "Run Order" in line and "====" in line:
+            header_seen = True
+            continue
+        if in_run_order and header_seen and "[node type]" in line:
+            continue  # skip column header
+        if in_run_order and header_seen and "====" in line:
+            # Next section (Top by Computation Time) — stop
+            break
+        if in_run_order and header_seen and line.strip():
+            # Parse table row:
+            # "  Teflon Delegate       14.399       14.121     96.259%  ..."
+            parts = line.split()
+            if len(parts) >= 6:
+                # node_type can be multi-word, find the first numeric column
+                numeric_start = -1
+                for i, p in enumerate(parts):
+                    try:
+                        float(p)
+                        numeric_start = i
+                        break
+                    except ValueError:
+                        continue
+                if numeric_start >= 2:
+                    node_type = " ".join(parts[:numeric_start])
+                    avg_ms = parts[numeric_start + 1] if numeric_start + 1 < len(parts) else "?"
+                    pct = parts[numeric_start + 2] if numeric_start + 2 < len(parts) else "?"
+                    # Name is after the last numeric-like column, inside [...]
+                    name_match = re.search(r"\[(.+?)\]:\d+\s*$", line)
+                    name = name_match.group(1) if name_match else ""
+                    rows.append({"node_type": node_type, "avg_ms": avg_ms, "pct": pct, "name": name})
+    return rows
 
 
 def run_inference_test(model_path: Path, sys_info: SystemInfo, *, trace: bool = False) -> None:
@@ -732,16 +879,15 @@ def run_inference_test(model_path: Path, sys_info: SystemInfo, *, trace: bool = 
     num_runs = num_runs_for_model(model_path)
     model_size_mb = model_path.stat().st_size / (1024 * 1024)
     info(f"Model: {model_path.name} ({model_size_mb:.1f} MB, n={num_runs})")
+    check_model_int8(model_path)
 
     # -- CPU baseline (XNNPACK) ------------------------------------------------
     info("Starting CPU benchmark (XNNPACK) ...")
     cpu_interp = Interpreter(model_path=str(model_path), num_threads=CPU_NUM_THREADS)
     cpu_interp.allocate_tensors()
 
-    cpu_total_nodes = 0
     if trace:
         header("Trace: Op-Partitionierung")
-        cpu_total_nodes = _trace_node_details(cpu_interp, "CPU")
 
     input_data = create_test_input(cpu_interp.get_input_details())
     cpu_result = benchmark_inference(cpu_interp, input_data, num_warmup=CPU_WARMUP_RUNS, num_runs=num_runs)
@@ -758,30 +904,69 @@ def run_inference_test(model_path: Path, sys_info: SystemInfo, *, trace: bool = 
 
     if teflon_path:
         info("Starting NPU benchmark (Teflon delegate) ...")
-        npu_result = _run_npu_benchmark_isolated(model_path, teflon_path, input_data, num_runs, trace=trace)
+        npu_result = _run_npu_benchmark_isolated(model_path, teflon_path, input_data, num_runs)
         if npu_result:
             ok(
                 f"NPU:  {npu_result['mean_ms']:.1f} ms ± {npu_result['std_ms']:.1f} ms  "
                 f"(median {npu_result['median_ms']:.1f} ms, min {npu_result['min_ms']:.1f} ms, "
                 f"n={npu_result['num_runs']})"
             )
-        if trace and npu_result:
-            npu_node_count = npu_result.get("npu_total_nodes", 0)
-            npu_op_counts = npu_result.get("npu_op_counts", {})
-            if npu_op_counts:
-                info(f"  [NPU+Delegate] {npu_node_count} Nodes:")
-                for name, count in sorted(npu_op_counts.items(), key=lambda x: -x[1]):
-                    info(f"    {name}: {count}")
-                # Count delegated vs CPU-fallback nodes
-                delegated = sum(c for n, c in npu_op_counts.items() if "delegate" in n.lower() or "teflon" in n.lower())
-                cpu_fallback = npu_node_count - delegated
-                if delegated > 0:
-                    info(f"  → {delegated} delegierte Node(s) (NPU), {cpu_fallback} CPU-Fallback Node(s)")
-                    if cpu_total_nodes > 0:
-                        pct = delegated / cpu_total_nodes * 100
-                        info(f"  → {pct:.0f}% der Original-Ops wurden zu {delegated} Delegate-Node(s) zusammengefasst")
+        if trace and npu_result and teflon_path:
+            # benchmark_model liefert die echte Per-Op-Partitionierung (NPU vs CPU).
+            # _get_ops_details() ist dafür unbrauchbar — es listet absorbierte Ops
+            # weiterhin einzeln auf, auch wenn sie im Delegate-Node laufen.
+            bm_output = _run_benchmark_model_profiling(model_path, teflon_path)
+            if bm_output:
+                profile_rows = _parse_benchmark_profile(bm_output)
+                if profile_rows:
+                    header("Trace: Op-Partitionierung (benchmark_model)")
+                    npu_rows = [r for r in profile_rows if "teflon" in r["node_type"].lower()]
+                    cpu_rows = [r for r in profile_rows if "teflon" not in r["node_type"].lower()]
+
+                    npu_pct = sum(float(r["pct"].rstrip("%")) for r in npu_rows if r["pct"] != "?")
+                    cpu_pct = sum(float(r["pct"].rstrip("%")) for r in cpu_rows if r["pct"] != "?")
+
+                    if npu_rows:
+                        ok(f"NPU (Teflon Delegate): {len(npu_rows)} Partition(en), {npu_pct:.1f}% der Rechenzeit")
+                        for r in npu_rows:
+                            # Kürze den Namen für die Anzeige
+                            name = r["name"]
+                            if ";" in name:
+                                name = name.split(";")[0] + " ..."
+                            info(f"    {r['avg_ms']} ms ({r['pct']})  {name}")
+                    else:
+                        fail("NPU: Teflon hat keine Partitionen übernommen")
+
+                    if cpu_rows:
+                        warn(f"CPU-Fallback: {len(cpu_rows)} Op(s), {cpu_pct:.1f}% der Rechenzeit")
+                        for r in cpu_rows:
+                            info(f"    {r['node_type']}: {r['avg_ms']} ms ({r['pct']})")
+
+                    # Gesamtbewertung
+                    if npu_pct > 90:
+                        ok(f"Teflon delegiert {npu_pct:.0f}% — NPU wird voll genutzt")
+                        if npu_result["mean_ms"] > cpu_result["mean_ms"]:
+                            info("NPU trotzdem langsamer als CPU — Rocket-Treiber noch in Entwicklung")
+                    elif npu_pct > 50:
+                        warn(f"Teflon delegiert nur {npu_pct:.0f}% — CPU-Fallback bremst")
+                    elif npu_pct > 0:
+                        warn(f"Teflon delegiert nur {npu_pct:.0f}% — kaum NPU-Nutzung")
+                    # else: already reported "keine Partitionen"
                 else:
-                    warn("  Keine Delegate-Nodes erkannt — möglicherweise läuft alles auf CPU")
+                    warn("benchmark_model Output konnte nicht geparst werden")
+                    info("Manuell prüfen:")
+                    info(f"  TEFLON_DEBUG=1 ROCKET_DEBUG=1 benchmark_model \\")
+                    info(f"    --graph={model_path} \\")
+                    info(f"    --external_delegate_path={teflon_path} \\")
+                    info("    --enable_op_profiling=true")
+            else:
+                warn("benchmark_model nicht verfügbar — kein Per-Op-Profiling möglich")
+                info("Installation:")
+                info("  wget -O /usr/local/bin/benchmark_model \\")
+                info(
+                    "    https://storage.googleapis.com/tensorflow-nightly-public/prod/tensorflow/release/lite/tools/nightly/latest/linux_aarch64_benchmark_model"
+                )
+                info("  chmod +x /usr/local/bin/benchmark_model")
     else:
         warn("Teflon delegate not available — skipping NPU benchmark")
         info("Only CPU results available")
@@ -826,6 +1011,24 @@ def main() -> None:
         help="System check only, no inference",
     )
     parser.add_argument(
+        "--check-int8",
+        action="store_true",
+        help="Nur INT8-Quantisierung des Models prüfen (keine Inference)",
+    )
+    parser.add_argument(
+        "--convert-int8",
+        type=Path,
+        metavar="SOURCE",
+        help="Float-Model zu INT8 konvertieren (SavedModel-Dir, .h5 oder .keras). Output: --convert-int8-output",
+    )
+    parser.add_argument(
+        "--convert-int8-output",
+        type=Path,
+        default=None,
+        metavar="OUTPUT",
+        help="Ausgabepfad für konvertiertes INT8-Model (default: <source>_int8.tflite)",
+    )
+    parser.add_argument(
         "--trace",
         action="store_true",
         help="Zeige Delegate-Trace: Op-Partitionierung (NPU vs CPU), Mesa/Teflon Debug-Output",
@@ -853,6 +1056,35 @@ def main() -> None:
     if args.check_only:
         print()
         return
+
+    # --convert-int8: convert float model to full INT8
+    if args.convert_int8:
+        source = args.convert_int8
+        if not source.exists():
+            fail(f"Quell-Model nicht gefunden: {source}")
+            sys.exit(1)
+        output = args.convert_int8_output
+        if output is None:
+            stem = source.stem if source.is_file() else source.name
+            output = source.parent / f"{stem}_int8.tflite"
+        header("INT8-Konvertierung")
+        convert_model_int8(source, output)
+        print()
+        return
+
+    # --check-int8: only check quantization, no benchmark
+    if args.check_int8:
+        if args.model:
+            if not args.model.exists():
+                fail(f"Model nicht gefunden: {args.model}")
+                sys.exit(1)
+            model_path = args.model
+        else:
+            model_path = download_model(args.preset)
+        header("INT8-Quantisierung")
+        is_int8 = check_model_int8(model_path)
+        print()
+        sys.exit(0 if is_int8 else 1)
 
     # Determine model
     if args.model:
