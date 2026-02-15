@@ -16,6 +16,7 @@ set -euo pipefail
 # -- Configuration -------------------------------------------------------------
 # IMPORTANT: MESA_VERSION must match between build-mesa-teflon.sh and release-mesa-teflon.sh
 MESA_VERSION="mesa-25.3.5"
+MESA_GIT_URL="https://gitlab.freedesktop.org/mesa/mesa.git"
 VERSION_SHORT="${MESA_VERSION#mesa-}"
 RELEASE_TAG="teflon-v${VERSION_SHORT}"
 DEFAULT_DIST_DIR="/tmp/mesa-teflon-build/dist"
@@ -23,13 +24,73 @@ DEFAULT_DIST_DIR="/tmp/mesa-teflon-build/dist"
 # -- Colors --------------------------------------------------------------------
 GREEN="\033[0;32m"
 RED="\033[0;31m"
+YELLOW="\033[1;33m"
 CYAN="\033[0;36m"
 BOLD="\033[1m"
 NC="\033[0m"
 
 ok()   { echo -e "  ${GREEN}✔${NC} $*"; }
 fail() { echo -e "  ${RED}✘${NC} $*"; }
+warn() { echo -e "  ${YELLOW}⚠${NC} $*"; }
 info() { echo -e "  ${CYAN}ℹ${NC} $*"; }
+
+# -- Check for newer Mesa version --------------------------------------------
+check_mesa_version() {
+    info "Checking current Mesa version on GitLab ..."
+    # Fetch stable release tags (mesa-XX.Y.Z), ignore RCs and pre-releases
+    LATEST_TAG=$(git ls-remote --tags --refs "$MESA_GIT_URL" 'refs/tags/mesa-*' 2>/dev/null \
+        | awk '{print $2}' \
+        | sed 's|refs/tags/||' \
+        | grep -E '^mesa-[0-9]+\.[0-9]+\.[0-9]+$' \
+        | sort -V \
+        | tail -1)
+
+    if [[ -z "$LATEST_TAG" ]]; then
+        warn "Could not determine current Mesa version (network issue?)"
+        return
+    fi
+
+    ok "Configured version: ${BOLD}${MESA_VERSION}${NC}"
+    ok "Latest stable version: ${BOLD}${LATEST_TAG}${NC}"
+
+    if [[ "$LATEST_TAG" != "$MESA_VERSION" ]]; then
+        # Check if configured version is older
+        NEWER=$(printf '%s\n' "$MESA_VERSION" "$LATEST_TAG" | sort -V | tail -1)
+        if [[ "$NEWER" == "$LATEST_TAG" ]]; then
+            warn "Newer Mesa version available: ${BOLD}${LATEST_TAG}${NC} (current: ${MESA_VERSION})"
+            if [[ -t 0 ]]; then
+                info "Options:"
+                echo "    [1] Use newer version (${LATEST_TAG})"
+                echo "    [2] Continue with configured version (${MESA_VERSION})"
+                echo "    [3] Abort"
+                read -r -p "  Choice [1/2/3]: " choice
+                case "$choice" in
+                    1)
+                        info "Using ${BOLD}${LATEST_TAG}${NC} instead of ${MESA_VERSION}"
+                        MESA_VERSION="$LATEST_TAG"
+                        VERSION_SHORT="${MESA_VERSION#mesa-}"
+                        RELEASE_TAG="teflon-v${VERSION_SHORT}"
+                        warn "build-mesa-teflon.sh must be updated manually to ${LATEST_TAG}."
+                        ;;
+                    3)
+                        info "Aborted."
+                        exit 0
+                        ;;
+                    *)
+                        info "Continuing with configured version ${BOLD}${MESA_VERSION}${NC}."
+                        ;;
+                esac
+            else
+                warn "Update MESA_VERSION in this script and build-mesa-teflon.sh to upgrade."
+            fi
+        else
+            info "Configured version (${MESA_VERSION}) is newer than latest stable release (${LATEST_TAG})"
+        fi
+    else
+        ok "Mesa version is up to date"
+    fi
+}
+check_mesa_version
 
 # -- Arguments -----------------------------------------------------------------
 DIST_DIR="${1:-$DEFAULT_DIST_DIR}"

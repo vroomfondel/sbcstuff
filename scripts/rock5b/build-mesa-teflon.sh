@@ -72,6 +72,62 @@ if [[ "$ARCH" != "aarch64" ]]; then
     exit 1
 fi
 
+# -- Check for newer Mesa version --------------------------------------------
+check_mesa_version() {
+    info "Checking current Mesa version on GitLab ..."
+    # Fetch stable release tags (mesa-XX.Y.Z), ignore RCs and pre-releases
+    LATEST_TAG=$(git ls-remote --tags --refs "$MESA_GIT_URL" 'refs/tags/mesa-*' 2>/dev/null \
+        | awk '{print $2}' \
+        | sed 's|refs/tags/||' \
+        | grep -E '^mesa-[0-9]+\.[0-9]+\.[0-9]+$' \
+        | sort -V \
+        | tail -1)
+
+    if [[ -z "$LATEST_TAG" ]]; then
+        warn "Could not determine current Mesa version (network issue?)"
+        return
+    fi
+
+    ok "Configured version: ${BOLD}${MESA_VERSION}${NC}"
+    ok "Latest stable version: ${BOLD}${LATEST_TAG}${NC}"
+
+    if [[ "$LATEST_TAG" != "$MESA_VERSION" ]]; then
+        # Check if configured version is older
+        NEWER=$(printf '%s\n' "$MESA_VERSION" "$LATEST_TAG" | sort -V | tail -1)
+        if [[ "$NEWER" == "$LATEST_TAG" ]]; then
+            warn "Newer Mesa version available: ${BOLD}${LATEST_TAG}${NC} (current: ${MESA_VERSION})"
+            if [[ -t 0 ]]; then
+                info "Options:"
+                echo "    [1] Use newer version (${LATEST_TAG})"
+                echo "    [2] Continue with configured version (${MESA_VERSION})"
+                echo "    [3] Abort"
+                read -r -p "  Choice [1/2/3]: " choice
+                case "$choice" in
+                    1)
+                        info "Using ${BOLD}${LATEST_TAG}${NC} instead of ${MESA_VERSION}"
+                        MESA_VERSION="$LATEST_TAG"
+                        warn "release-mesa-teflon.sh must be updated manually to ${LATEST_TAG}."
+                        ;;
+                    3)
+                        info "Aborted."
+                        exit 0
+                        ;;
+                    *)
+                        info "Continuing with configured version ${BOLD}${MESA_VERSION}${NC}."
+                        ;;
+                esac
+            else
+                warn "Update MESA_VERSION in this script and release-mesa-teflon.sh to upgrade."
+            fi
+        else
+            info "Configured version (${MESA_VERSION}) is newer than latest stable release (${LATEST_TAG})"
+        fi
+    else
+        ok "Mesa version is up to date"
+    fi
+}
+check_mesa_version
+
 # -- Dependencies --------------------------------------------------------------
 install_deps() {
     echo -e "\n${BOLD}══ Installing build dependencies ══${NC}"

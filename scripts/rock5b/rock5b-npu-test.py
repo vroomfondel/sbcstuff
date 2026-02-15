@@ -48,7 +48,7 @@ Manual preparation on the board:
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -73,6 +73,28 @@ if TYPE_CHECKING:
         accel_dev: str | None
         devfreq: dict[str, str] | None
         teflon_path: str | None
+
+    class TensorDetails(TypedDict):
+        shape: tuple[int, ...]
+        dtype: type[numpy.generic]
+
+    class OpDetails(TypedDict):
+        index: int
+        op_name: str
+        inputs: list[int]
+        outputs: list[int]
+
+    class PartitionDetail(TypedDict):
+        num_ops: int
+        op_types: dict[str, int]
+
+    class PartitionInfo(TypedDict):
+        num_partitions: int
+        total_regular_ops: int
+        absorbed_ops: int
+        cpu_fallback_ops: int
+        partitions: list[PartitionDetail]
+        cpu_fallback_types: dict[str, int]
 
 
 APT_DEPENDENCIES = ["python3-pip", "libdrm2"]
@@ -648,12 +670,12 @@ def convert_model_int8(source: Path, output: Path, *, num_calibration: int = 100
     return output
 
 
-def create_test_input(input_details: list[dict[str, object]]) -> numpy.ndarray:
+def create_test_input(input_details: list[TensorDetails]) -> numpy.ndarray:
     """Create a random test input matching the model's expected shape."""
     import numpy as np
 
-    shape: tuple[int, ...] = input_details[0]["shape"]  # type: ignore[assignment]
-    dtype: type[np.generic] = input_details[0]["dtype"]  # type: ignore[assignment]
+    shape: tuple[int, ...] = input_details[0]["shape"]
+    dtype: type[np.generic] = input_details[0]["dtype"]
     info(f"Input shape: {shape}, dtype: {dtype.__name__}")
 
     if dtype == np.uint8:
@@ -747,7 +769,7 @@ def _run_npu_benchmark_isolated(
     num_runs: int,
     *,
     trace: bool = False,
-) -> tuple[BenchmarkResult, dict[str, object] | None] | None:
+) -> tuple[BenchmarkResult, PartitionInfo | None] | None:
     """Run NPU benchmark in a child process to survive driver crashes.
 
     Returns (benchmark_result, partition_analysis) or None on failure.
@@ -798,7 +820,7 @@ def _run_npu_benchmark_isolated(
         with open(result_file) as f:
             raw = json.load(f)
         raw["output_shape"] = tuple(raw["output_shape"])
-        partition_analysis: dict[str, object] | None = raw.pop("partition_analysis", None)
+        partition_analysis: PartitionInfo | None = raw.pop("partition_analysis", None)
         return raw, partition_analysis
 
     except Exception as e:
@@ -808,7 +830,7 @@ def _run_npu_benchmark_isolated(
         Path(result_file).unlink(missing_ok=True)
 
 
-def _analyze_delegate_partitions(model_path: str, teflon_path: str) -> dict[str, object] | None:
+def _analyze_delegate_partitions(model_path: str, teflon_path: str) -> PartitionInfo | None:
     """Differentielle Analyse der Delegate-Partitionierung.
 
     Strategie:
@@ -839,7 +861,7 @@ def _analyze_delegate_partitions(model_path: str, teflon_path: str) -> dict[str,
                 experimental_delegates=[delegate],
             )
         npu_interp.allocate_tensors()
-        npu_ops: list[dict[str, object]] = npu_interp._get_ops_details()  # noqa: SLF001
+        npu_ops: list[OpDetails] = cast("list[OpDetails]", npu_interp._get_ops_details())  # noqa: SLF001
     except AttributeError:
         return None
 
@@ -854,19 +876,20 @@ def _analyze_delegate_partitions(model_path: str, teflon_path: str) -> dict[str,
         try:
             cpu_interp = Interpreter(model_path=model_path)
             cpu_interp.allocate_tensors()
-            cpu_ops: list[dict[str, object]] = cpu_interp._get_ops_details()  # noqa: SLF001
+            cpu_ops: list[OpDetails] = cast("list[OpDetails]", cpu_interp._get_ops_details())  # noqa: SLF001
         except AttributeError:
             return None
 
         cpu_sigs: set[tuple[tuple[int, ...], tuple[int, ...]]] = set()
         for op in cpu_ops:
             if op["op_name"] == "DELEGATE":
-                sig = (tuple(sorted(op["inputs"])), tuple(sorted(op["outputs"])))  # type: ignore[call-overload]
+                sig = (tuple(sorted(op["inputs"])), tuple(sorted(op["outputs"])))
                 cpu_sigs.add(sig)
 
         teflon_delegates = []
         for op in all_delegates:
-            sig = (tuple(sorted(op["inputs"])), tuple(sorted(op["outputs"])))  # type: ignore[call-overload]
+            sig = (tuple(sorted(op["inputs"])), tuple(sorted(op["outputs"])))
+
             if sig not in cpu_sigs:
                 teflon_delegates.append(op)
 
@@ -883,11 +906,11 @@ def _analyze_delegate_partitions(model_path: str, teflon_path: str) -> dict[str,
     # Tensor → Producer-Op Mapping
     tensor_producer: dict[int, int] = {}
     for op in regular_ops:
-        for t in op["outputs"]:  # type: ignore[attr-defined]
-            tensor_producer[t] = op["index"]  # type: ignore[assignment]
+        for t in op["outputs"]:
+            tensor_producer[t] = op["index"]
 
     # Op-Index → Op Lookup
-    op_by_index: dict[int, dict[str, object]] = {op["index"]: op for op in regular_ops}  # type: ignore[misc]
+    op_by_index: dict[int, OpDetails] = {op["index"]: op for op in regular_ops}
 
     # Rückwärts-Tracing von DELEGATE-Outputs durch den regulären Op-Graphen.
     #
@@ -898,15 +921,15 @@ def _analyze_delegate_partitions(model_path: str, teflon_path: str) -> dict[str,
     # Stattdessen: rückwärts tracen bis kein Producer mehr existiert (Weights,
     # Model-Input). Delegates nach Output-Tensor sortieren (früheste zuerst),
     # damit all_absorbed als natürliche Partitions-Grenze wirkt.
-    teflon_delegates.sort(key=lambda d: min(d["outputs"]))  # type: ignore[call-overload]
+    teflon_delegates.sort(key=lambda d: min(d["outputs"]))
 
-    absorbed_per_partition: list[list[dict[str, object]]] = []
+    absorbed_per_partition: list[list[OpDetails]] = []
     all_absorbed: set[int] = set()
 
     for td in teflon_delegates:
         absorbed: set[int] = set()
         visited: set[int] = set()
-        queue = list(td["outputs"])  # type: ignore[call-overload]
+        queue = list(td["outputs"])
 
         while queue:
             tensor = queue.pop()
@@ -922,9 +945,9 @@ def _analyze_delegate_partitions(model_path: str, teflon_path: str) -> dict[str,
             absorbed.add(op_idx)
 
             # Weiter rückwärts durch ALLE Inputs dieser Op
-            op = op_by_index.get(op_idx)  # type: ignore[assignment]
-            if op:
-                for inp_t in op["inputs"]:  # type: ignore[attr-defined]
+            producer_op = op_by_index.get(op_idx)
+            if producer_op:
+                for inp_t in producer_op["inputs"]:
                     queue.append(inp_t)
 
         partition_ops = [op_by_index[idx] for idx in sorted(absorbed) if idx in op_by_index]
@@ -934,7 +957,7 @@ def _analyze_delegate_partitions(model_path: str, teflon_path: str) -> dict[str,
     cpu_fallback = [op for op in regular_ops if op["index"] not in all_absorbed]
 
     # Ergebnis aufbereiten
-    partitions: list[dict[str, object]] = []
+    partitions: list[PartitionDetail] = []
     for ops in absorbed_per_partition:
         partitions.append({"num_ops": len(ops), "op_types": _count_op_types(ops)})
 
@@ -948,7 +971,7 @@ def _analyze_delegate_partitions(model_path: str, teflon_path: str) -> dict[str,
     }
 
 
-def _count_op_types(ops: list[dict[str, object]]) -> dict[str, int]:
+def _count_op_types(ops: list[OpDetails]) -> dict[str, int]:
     """Zähle Op-Typen in einer Liste von Ops."""
     counts: dict[str, int] = {}
     for op in ops:
@@ -965,7 +988,7 @@ def _format_op_types(type_counts: dict[str, int]) -> str:
 
 
 def _print_partition_trace(
-    partition_info: dict[str, object] | None,
+    partition_info: PartitionInfo | None,
     npu_result: BenchmarkResult,
     cpu_result: BenchmarkResult,
 ) -> None:
@@ -976,12 +999,12 @@ def _print_partition_trace(
         warn("Delegate-Analyse nicht verfügbar (_get_ops_details() fehlt)")
         return
 
-    num_partitions: int = partition_info["num_partitions"]  # type: ignore[assignment]
-    total_ops: int = partition_info["total_regular_ops"]  # type: ignore[assignment]
-    absorbed: int = partition_info["absorbed_ops"]  # type: ignore[assignment]
-    cpu_fallback_count: int = partition_info["cpu_fallback_ops"]  # type: ignore[assignment]
-    partitions: list[dict[str, object]] = partition_info["partitions"]  # type: ignore[assignment]
-    cpu_fallback_types: dict[str, int] = partition_info["cpu_fallback_types"]  # type: ignore[assignment]
+    num_partitions = partition_info["num_partitions"]
+    total_ops = partition_info["total_regular_ops"]
+    absorbed = partition_info["absorbed_ops"]
+    cpu_fallback_count = partition_info["cpu_fallback_ops"]
+    partitions = partition_info["partitions"]
+    cpu_fallback_types = partition_info["cpu_fallback_types"]
 
     if num_partitions == 0:
         fail("Teflon hat keine Ops übernommen — alle Ops laufen auf CPU")
@@ -991,8 +1014,8 @@ def _print_partition_trace(
     ok(f"Teflon: {num_partitions} Partition(en), {absorbed} von {total_ops} Ops absorbiert ({pct:.0f}%)")
 
     for i, part in enumerate(partitions, 1):
-        op_types: dict[str, int] = part["op_types"]  # type: ignore[assignment]
-        num_ops: int = part["num_ops"]  # type: ignore[assignment]
+        op_types = part["op_types"]
+        num_ops = part["num_ops"]
         sorted_types = sorted(op_types.items(), key=lambda x: x[1], reverse=True)
         info(f"  Partition {i}: {num_ops} Ops")
         for name, count in sorted_types:
@@ -1032,7 +1055,7 @@ def run_inference_test(model_path: Path, sys_info: SystemInfo, *, trace: bool = 
     cpu_interp = Interpreter(model_path=str(model_path), num_threads=CPU_NUM_THREADS)
     cpu_interp.allocate_tensors()
 
-    input_data = create_test_input(cpu_interp.get_input_details())
+    input_data = create_test_input(cast("list[TensorDetails]", cpu_interp.get_input_details()))
     cpu_result = benchmark_inference(cpu_interp, input_data, num_warmup=CPU_WARMUP_RUNS, num_runs=num_runs)
 
     ok(
@@ -1044,7 +1067,7 @@ def run_inference_test(model_path: Path, sys_info: SystemInfo, *, trace: bool = 
     # -- NPU via Teflon delegate -----------------------------------------------
     teflon_path = sys_info.get("teflon_path")
     npu_result: BenchmarkResult | None = None
-    partition_info: dict[str, object] | None = None
+    partition_info: PartitionInfo | None = None
 
     if teflon_path:
         info("Starting NPU benchmark (Teflon delegate) ...")
