@@ -39,6 +39,7 @@ packages = ["scripts"]
 
 [tool.black]
 line-length = 120
+target-version = ["py312"]  # Rock 5B scripts run on Python 3.12 (Ubuntu Noble)
 
 [tool.isort]
 profile = "black"

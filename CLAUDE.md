@@ -90,6 +90,7 @@ Pre-commit hooks: black (check + diff mode), mypy, gitleaks. Config in `.pre-com
 - **Auto-install pattern**: Some scripts (`blurimage.py`, `update_badge.py`) use an `install_and_import()` helper to pip-install missing packages at runtime.
 - **asyncio_mode = "auto"**: Pytest auto-detects async tests, no need for `@pytest.mark.asyncio`.
 - **`*.local.*` files are gitignored** — used for credentials and unredacted screenshots. Never commit these.
+- **Exception syntax**: Always parenthesize multiple exception types: `except (FileNotFoundError, OSError):` — never use the comma-only form `except FileNotFoundError, OSError:` (Python 2 syntax, SyntaxError in Python 3).
 
 ## repo_scripts/
 

@@ -641,20 +641,6 @@ scp /tmp/mesa-teflon-build/dist/* user@workstation:sbcstuff/
 
 Creates release tag `teflon-v<version>` (e.g., `teflon-v25.3.5`) with install instructions in the release body.
 
-
-## License
-This project is licensed under the LGPL where applicable/possible — see [LICENSE.md](LICENSE.md). Some files/parts may use other licenses: [MIT](LICENSEMIT.md) | [GPL](LICENSEGPL.md) | [LGPL](LICENSELGPL.md). Always check per‑file headers/comments.
-
-
-## Authors
-- Repo owner (primary author)
-- Additional attributions are noted inline in code comments
-
-
-## Acknowledgments
-- Inspirations and snippets are referenced in code comments where appropriate.
-
-
 ## Screenshots — LUKS Encryption on Rock 5B (NVMe Migration)
 
 Full run of `luks_encrypt.sh` on a Rock 5B with NVMe migration, LUKS2 + LVM + clevis/tang auto-unlock. Sensitive data (hostnames, tang URLs, UUIDs) redacted with `blurimage.py`.
@@ -680,6 +666,33 @@ Full run of `luks_encrypt.sh` on a Rock 5B with NVMe migration, LUKS2 + LVM + cl
 ![cryptsetup luksDump — LUKS2 header, keyslots, segments](Bildschirmfoto_2026-02-14_20-13-06_blurred.png)
 
 ![cryptsetup luksDump — keyslot digests and token details](Bildschirmfoto_2026-02-14_20-13-28_blurred.png)
+
+---
+
+## Screenshots — NPU Benchmark on Rock 5B (Rocket / Teflon)
+
+`rock5b-npu-test.py` with `--trace` on a Rock 5B (RK3588, mainline kernel 6.18, Rocket driver, Mesa Teflon delegate). Shows delegate partition analysis and `benchmark_model` op profiling for validation.
+
+### Delegate partition trace (--trace --preset small)
+
+![rock5b-npu-test.py --trace --preset small — system checks, CPU/NPU benchmark, delegate partition analysis](Bildschirmfoto_2026-02-15_13-18-55_blurred.png)
+
+### benchmark_model op profiling (validation)
+
+![benchmark_model --enable_op_profiling — per-node execution times, Teflon delegate partitions, CPU fallback ops](Bildschirmfoto_2026-02-15_13-20-55_blurred.png)
+
+
+## License
+This project is licensed under the LGPL where applicable/possible — see [LICENSE.md](LICENSE.md). Some files/parts may use other licenses: [MIT](LICENSEMIT.md) | [GPL](LICENSEGPL.md) | [LGPL](LICENSELGPL.md). Always check per‑file headers/comments.
+
+
+## Authors
+- Repo owner (primary author)
+- Additional attributions are noted inline in code comments
+
+
+## Acknowledgments
+- Inspirations and snippets are referenced in code comments where appropriate.
 
 ---
 

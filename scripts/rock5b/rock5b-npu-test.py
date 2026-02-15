@@ -98,7 +98,7 @@ def _ensure_apt_packages() -> None:
     print(f"  \033[0;36mℹ\033[0m Installiere fehlende Pakete: {', '.join(missing)} ...")
     try:
         _sp.check_call(["apt-get", "install", "-y"] + missing)
-    except FileNotFoundError, _sp.CalledProcessError:
+    except (FileNotFoundError, _sp.CalledProcessError):
         print(f"  \033[0;31m✘\033[0m apt-Installation fehlgeschlagen: {', '.join(missing)}")
         print(f"  \033[0;36mℹ\033[0m Manuell: sudo apt install {' '.join(missing)}")
         sys.exit(1)
@@ -161,7 +161,6 @@ import argparse
 import os
 import platform
 import re
-import shutil
 import subprocess
 import sys
 import time
@@ -390,7 +389,7 @@ def find_teflon_delegate() -> str | None:
                 parts = line.split("=>")
                 if len(parts) == 2:
                     return parts[1].strip()
-    except subprocess.TimeoutExpired, FileNotFoundError:
+    except (subprocess.TimeoutExpired, FileNotFoundError):
         pass
 
     return None
@@ -407,7 +406,7 @@ def check_dmesg_rocket() -> list[str]:
                     lines.append(line.strip())
             if lines:
                 return lines
-        except subprocess.TimeoutExpired, FileNotFoundError, PermissionError:
+        except (subprocess.TimeoutExpired, FileNotFoundError, PermissionError):
             continue
     return []
 
@@ -464,7 +463,7 @@ def run_system_checks() -> SystemInfo:
             cur_mhz = int(cur) // 1_000_000
             max_mhz = int(max_f) // 1_000_000
             ok(f"NPU DevFreq: {cur_mhz} MHz / max {max_mhz} MHz (governor: {gov})")
-        except ValueError, TypeError:
+        except (ValueError, TypeError):
             ok(f"NPU DevFreq: cur={cur} max={max_f} governor={gov}")
     else:
         warn("NPU DevFreq not found (fdab0000.npu)")
@@ -713,6 +712,7 @@ def _npu_worker(
     input_dtype: str,
     num_runs: int,
     result_file: str,
+    trace: bool = False,
 ) -> None:
     """Child process: run NPU inference and write results to a temp file."""
     import json
@@ -732,14 +732,27 @@ def _npu_worker(
     # numpy types are not JSON-serializable — convert for json.dump
     serializable: dict[str, object] = {**result, "output_shape": list(result["output_shape"])}
 
+    if trace:
+        partition_analysis = _analyze_delegate_partitions(model_path, teflon_path)
+        serializable["partition_analysis"] = partition_analysis
+
     with open(result_file, "w") as f:
         json.dump(serializable, f)
 
 
 def _run_npu_benchmark_isolated(
-    model_path: Path, teflon_path: str, input_data: numpy.ndarray, num_runs: int
-) -> BenchmarkResult | None:
-    """Run NPU benchmark in a child process to survive driver crashes."""
+    model_path: Path,
+    teflon_path: str,
+    input_data: numpy.ndarray,
+    num_runs: int,
+    *,
+    trace: bool = False,
+) -> tuple[BenchmarkResult, dict[str, object] | None] | None:
+    """Run NPU benchmark in a child process to survive driver crashes.
+
+    Returns (benchmark_result, partition_analysis) or None on failure.
+    partition_analysis is only populated when trace=True.
+    """
     import json
     import multiprocessing
     import tempfile
@@ -758,6 +771,7 @@ def _run_npu_benchmark_isolated(
                 str(input_data.dtype),
                 num_runs,
                 result_file,
+                trace,
             ),
         )
         proc.start()
@@ -782,9 +796,10 @@ def _run_npu_benchmark_isolated(
             return None
 
         with open(result_file) as f:
-            result = json.load(f)
-        result["output_shape"] = tuple(result["output_shape"])
-        return result
+            raw = json.load(f)
+        raw["output_shape"] = tuple(raw["output_shape"])
+        partition_analysis: dict[str, object] | None = raw.pop("partition_analysis", None)
+        return raw, partition_analysis
 
     except Exception as e:
         fail(f"NPU Benchmark Fehler: {e}")
@@ -793,87 +808,218 @@ def _run_npu_benchmark_isolated(
         Path(result_file).unlink(missing_ok=True)
 
 
-def _run_benchmark_model_profiling(model_path: Path, teflon_path: str) -> str | None:
-    """Run benchmark_model with op profiling and return stdout, or None if not available."""
-    benchmark_bin = shutil.which("benchmark_model")
-    if not benchmark_bin:
-        return None
+def _analyze_delegate_partitions(model_path: str, teflon_path: str) -> dict[str, object] | None:
+    """Differentielle Analyse der Delegate-Partitionierung.
 
-    env = {**os.environ, "TEFLON_DEBUG": "1", "ROCKET_DEBUG": "1"}
-    try:
-        result = subprocess.run(
-            [
-                benchmark_bin,
-                f"--graph={model_path}",
-                f"--external_delegate_path={teflon_path}",
-                "--enable_op_profiling=true",
-                "--num_runs=20",
-                "--warmup_runs=5",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=SUBPROCESS_TIMEOUT * 2,
-            env=env,
-        )
-        return result.stdout + result.stderr
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
-        warn(f"benchmark_model fehlgeschlagen: {e}")
-        return None
-
-
-def _parse_benchmark_profile(output: str) -> list[dict[str, str]]:
-    """Parse the 'Run Order' table from benchmark_model output.
-
-    Returns list of dicts with keys: node_type, avg_ms, pct, name.
+    Strategie:
+    1. Interpreter mit Teflon erstellen, XNNPACK deaktivieren (experimental_op_resolver_type=3).
+       Dann sind ALLE DELEGATE-Nodes garantiert Teflon-Partitionen.
+       Fallback: mit XNNPACK, dann Signatur-Vergleich gegen CPU-only Interpreter.
+    2. Rückwärts-Tracing von DELEGATE-Outputs durch den regulären Op-Graphen.
+       Stoppt an Tensoren ohne Producer (Weights, Model-Input) und an Ops
+       die bereits einer früheren Partition zugeordnet sind.
     """
-    rows: list[dict[str, str]] = []
-    in_run_order = False
-    header_seen = False
+    Interpreter, load_delegate = load_tflite_runtime()
 
-    for line in output.splitlines():
-        # Look for the "Operator-wise" Run Order section
-        if "Operator-wise Profiling" in line:
-            in_run_order = True
-            header_seen = False
-            continue
-        if in_run_order and "Run Order" in line and "====" in line:
-            header_seen = True
-            continue
-        if in_run_order and header_seen and "[node type]" in line:
-            continue  # skip column header
-        if in_run_order and header_seen and "====" in line:
-            # Next section (Top by Computation Time) — stop
-            break
-        if in_run_order and header_seen and line.strip():
-            # Parse table row:
-            # "  Teflon Delegate       14.399       14.121     96.259%  ..."
-            parts = line.split()
-            if len(parts) >= 6:
-                # node_type can be multi-word, find the first numeric column
-                numeric_start = -1
-                for i, p in enumerate(parts):
-                    try:
-                        float(p)
-                        numeric_start = i
-                        break
-                    except ValueError:
-                        continue
-                if numeric_start >= 2:
-                    node_type = " ".join(parts[:numeric_start])
-                    avg_ms = parts[numeric_start + 1] if numeric_start + 1 < len(parts) else "?"
-                    pct = parts[numeric_start + 2] if numeric_start + 2 < len(parts) else "?"
-                    # Name is after the last numeric-like column, inside [...]
-                    name_match = re.search(r"\[(.+?)\]:\d+\s*$", line)
-                    name = name_match.group(1) if name_match else ""
-                    rows.append({"node_type": node_type, "avg_ms": avg_ms, "pct": pct, "name": name})
-    return rows
+    try:
+        delegate = load_delegate(teflon_path)
+
+        # Versuche XNNPACK zu deaktivieren → nur Teflon-DELEGATEs bleiben
+        xnnpack_disabled = False
+        try:
+            npu_interp = Interpreter(
+                model_path=model_path,
+                experimental_delegates=[delegate],
+                experimental_op_resolver_type=3,  # BUILTIN_WITHOUT_DEFAULT_DELEGATES
+            )
+            xnnpack_disabled = True
+        except (TypeError, ValueError):
+            npu_interp = Interpreter(
+                model_path=model_path,
+                experimental_delegates=[delegate],
+            )
+        npu_interp.allocate_tensors()
+        npu_ops: list[dict[str, object]] = npu_interp._get_ops_details()  # noqa: SLF001
+    except AttributeError:
+        return None
+
+    regular_ops = [op for op in npu_ops if op["op_name"] != "DELEGATE"]
+    all_delegates = [op for op in npu_ops if op["op_name"] == "DELEGATE"]
+
+    if xnnpack_disabled:
+        # Alle DELEGATE-Nodes sind Teflon
+        teflon_delegates = all_delegates
+    else:
+        # Fallback: Signatur-Vergleich mit CPU-only Interpreter
+        try:
+            cpu_interp = Interpreter(model_path=model_path)
+            cpu_interp.allocate_tensors()
+            cpu_ops: list[dict[str, object]] = cpu_interp._get_ops_details()  # noqa: SLF001
+        except AttributeError:
+            return None
+
+        cpu_sigs: set[tuple[tuple[int, ...], tuple[int, ...]]] = set()
+        for op in cpu_ops:
+            if op["op_name"] == "DELEGATE":
+                sig = (tuple(sorted(op["inputs"])), tuple(sorted(op["outputs"])))  # type: ignore[call-overload]
+                cpu_sigs.add(sig)
+
+        teflon_delegates = []
+        for op in all_delegates:
+            sig = (tuple(sorted(op["inputs"])), tuple(sorted(op["outputs"])))  # type: ignore[call-overload]
+            if sig not in cpu_sigs:
+                teflon_delegates.append(op)
+
+    if not teflon_delegates:
+        return {
+            "num_partitions": 0,
+            "total_regular_ops": len(regular_ops),
+            "absorbed_ops": 0,
+            "cpu_fallback_ops": len(regular_ops),
+            "partitions": [],
+            "cpu_fallback_types": _count_op_types(regular_ops),
+        }
+
+    # Tensor → Producer-Op Mapping
+    tensor_producer: dict[int, int] = {}
+    for op in regular_ops:
+        for t in op["outputs"]:  # type: ignore[attr-defined]
+            tensor_producer[t] = op["index"]  # type: ignore[assignment]
+
+    # Op-Index → Op Lookup
+    op_by_index: dict[int, dict[str, object]] = {op["index"]: op for op in regular_ops}  # type: ignore[misc]
+
+    # Rückwärts-Tracing von DELEGATE-Outputs durch den regulären Op-Graphen.
+    #
+    # DELEGATE-Node "inputs" in _get_ops_details() enthält ALLE Tensoren des
+    # absorbierten Subgraphen (inkl. interner Intermediates), nicht nur die
+    # Boundary-Tensoren. Daher NICHT als Stop-Bedingung verwenden.
+    #
+    # Stattdessen: rückwärts tracen bis kein Producer mehr existiert (Weights,
+    # Model-Input). Delegates nach Output-Tensor sortieren (früheste zuerst),
+    # damit all_absorbed als natürliche Partitions-Grenze wirkt.
+    teflon_delegates.sort(key=lambda d: min(d["outputs"]))  # type: ignore[call-overload]
+
+    absorbed_per_partition: list[list[dict[str, object]]] = []
+    all_absorbed: set[int] = set()
+
+    for td in teflon_delegates:
+        absorbed: set[int] = set()
+        visited: set[int] = set()
+        queue = list(td["outputs"])  # type: ignore[call-overload]
+
+        while queue:
+            tensor = queue.pop()
+            if tensor in visited:
+                continue
+            visited.add(tensor)
+
+            if tensor not in tensor_producer:
+                continue  # Weight, Bias oder Model-Input — kein Producer
+            op_idx = tensor_producer[tensor]
+            if op_idx in absorbed or op_idx in all_absorbed:
+                continue  # Bereits dieser oder einer früheren Partition zugeordnet
+            absorbed.add(op_idx)
+
+            # Weiter rückwärts durch ALLE Inputs dieser Op
+            op = op_by_index.get(op_idx)  # type: ignore[assignment]
+            if op:
+                for inp_t in op["inputs"]:  # type: ignore[attr-defined]
+                    queue.append(inp_t)
+
+        partition_ops = [op_by_index[idx] for idx in sorted(absorbed) if idx in op_by_index]
+        absorbed_per_partition.append(partition_ops)
+        all_absorbed.update(absorbed)
+
+    cpu_fallback = [op for op in regular_ops if op["index"] not in all_absorbed]
+
+    # Ergebnis aufbereiten
+    partitions: list[dict[str, object]] = []
+    for ops in absorbed_per_partition:
+        partitions.append({"num_ops": len(ops), "op_types": _count_op_types(ops)})
+
+    return {
+        "num_partitions": len(teflon_delegates),
+        "total_regular_ops": len(regular_ops),
+        "absorbed_ops": sum(len(ops) for ops in absorbed_per_partition),
+        "cpu_fallback_ops": len(cpu_fallback),
+        "partitions": partitions,
+        "cpu_fallback_types": _count_op_types(cpu_fallback),
+    }
+
+
+def _count_op_types(ops: list[dict[str, object]]) -> dict[str, int]:
+    """Zähle Op-Typen in einer Liste von Ops."""
+    counts: dict[str, int] = {}
+    for op in ops:
+        name = str(op["op_name"])
+        counts[name] = counts.get(name, 0) + 1
+    return counts
+
+
+def _format_op_types(type_counts: dict[str, int]) -> str:
+    """Formatiere Op-Typen als kompakte Auflistung mit Counts."""
+    sorted_types = sorted(type_counts.items(), key=lambda x: x[1], reverse=True)
+    parts = [f"{count}x {name}" if count > 1 else name for name, count in sorted_types]
+    return ", ".join(parts)
+
+
+def _print_partition_trace(
+    partition_info: dict[str, object] | None,
+    npu_result: BenchmarkResult,
+    cpu_result: BenchmarkResult,
+) -> None:
+    """Zeige Delegate-Partitionierung als Trace-Ausgabe."""
+    header("Trace: Delegate-Partitionierung")
+
+    if partition_info is None:
+        warn("Delegate-Analyse nicht verfügbar (_get_ops_details() fehlt)")
+        return
+
+    num_partitions: int = partition_info["num_partitions"]  # type: ignore[assignment]
+    total_ops: int = partition_info["total_regular_ops"]  # type: ignore[assignment]
+    absorbed: int = partition_info["absorbed_ops"]  # type: ignore[assignment]
+    cpu_fallback_count: int = partition_info["cpu_fallback_ops"]  # type: ignore[assignment]
+    partitions: list[dict[str, object]] = partition_info["partitions"]  # type: ignore[assignment]
+    cpu_fallback_types: dict[str, int] = partition_info["cpu_fallback_types"]  # type: ignore[assignment]
+
+    if num_partitions == 0:
+        fail("Teflon hat keine Ops übernommen — alle Ops laufen auf CPU")
+        return
+
+    pct = (absorbed / total_ops * 100) if total_ops > 0 else 0
+    ok(f"Teflon: {num_partitions} Partition(en), {absorbed} von {total_ops} Ops absorbiert ({pct:.0f}%)")
+
+    for i, part in enumerate(partitions, 1):
+        op_types: dict[str, int] = part["op_types"]  # type: ignore[assignment]
+        num_ops: int = part["num_ops"]  # type: ignore[assignment]
+        sorted_types = sorted(op_types.items(), key=lambda x: x[1], reverse=True)
+        info(f"  Partition {i}: {num_ops} Ops")
+        for name, count in sorted_types:
+            info(f"    {count:3d}x {name}")
+
+    if cpu_fallback_count > 0:
+        warn(f"CPU-Fallback: {cpu_fallback_count} Op(s)")
+        sorted_fb = sorted(cpu_fallback_types.items(), key=lambda x: x[1], reverse=True)
+        for name, count in sorted_fb:
+            info(f"    {count:3d}x {name}")
+
+    # Gesamtbewertung
+    if pct > 90:
+        ok(f"Teflon delegiert {pct:.0f}% — NPU wird voll genutzt")
+        if npu_result["mean_ms"] > cpu_result["mean_ms"]:
+            info("NPU trotzdem langsamer als CPU — Rocket-Treiber noch in Entwicklung")
+    elif pct > 50:
+        warn(f"Teflon delegiert nur {pct:.0f}% — CPU-Fallback bremst")
+    elif pct > 0:
+        warn(f"Teflon delegiert nur {pct:.0f}% — kaum NPU-Nutzung")
 
 
 def run_inference_test(model_path: Path, sys_info: SystemInfo, *, trace: bool = False) -> None:
     """Run CPU and (if available) NPU inference and compare results."""
     import numpy as np
 
-    Interpreter, load_delegate = load_tflite_runtime()
+    Interpreter, _ = load_tflite_runtime()
 
     header("Inference Benchmark")
     num_runs = num_runs_for_model(model_path)
@@ -886,9 +1032,6 @@ def run_inference_test(model_path: Path, sys_info: SystemInfo, *, trace: bool = 
     cpu_interp = Interpreter(model_path=str(model_path), num_threads=CPU_NUM_THREADS)
     cpu_interp.allocate_tensors()
 
-    if trace:
-        header("Trace: Op-Partitionierung")
-
     input_data = create_test_input(cpu_interp.get_input_details())
     cpu_result = benchmark_inference(cpu_interp, input_data, num_warmup=CPU_WARMUP_RUNS, num_runs=num_runs)
 
@@ -900,73 +1043,21 @@ def run_inference_test(model_path: Path, sys_info: SystemInfo, *, trace: bool = 
 
     # -- NPU via Teflon delegate -----------------------------------------------
     teflon_path = sys_info.get("teflon_path")
-    npu_result = None
+    npu_result: BenchmarkResult | None = None
+    partition_info: dict[str, object] | None = None
 
     if teflon_path:
         info("Starting NPU benchmark (Teflon delegate) ...")
-        npu_result = _run_npu_benchmark_isolated(model_path, teflon_path, input_data, num_runs)
-        if npu_result:
+        npu_raw = _run_npu_benchmark_isolated(model_path, teflon_path, input_data, num_runs, trace=trace)
+        if npu_raw is not None:
+            npu_result, partition_info = npu_raw
             ok(
                 f"NPU:  {npu_result['mean_ms']:.1f} ms ± {npu_result['std_ms']:.1f} ms  "
                 f"(median {npu_result['median_ms']:.1f} ms, min {npu_result['min_ms']:.1f} ms, "
                 f"n={npu_result['num_runs']})"
             )
         if trace and npu_result and teflon_path:
-            # benchmark_model liefert die echte Per-Op-Partitionierung (NPU vs CPU).
-            # _get_ops_details() ist dafür unbrauchbar — es listet absorbierte Ops
-            # weiterhin einzeln auf, auch wenn sie im Delegate-Node laufen.
-            bm_output = _run_benchmark_model_profiling(model_path, teflon_path)
-            if bm_output:
-                profile_rows = _parse_benchmark_profile(bm_output)
-                if profile_rows:
-                    header("Trace: Op-Partitionierung (benchmark_model)")
-                    npu_rows = [r for r in profile_rows if "teflon" in r["node_type"].lower()]
-                    cpu_rows = [r for r in profile_rows if "teflon" not in r["node_type"].lower()]
-
-                    npu_pct = sum(float(r["pct"].rstrip("%")) for r in npu_rows if r["pct"] != "?")
-                    cpu_pct = sum(float(r["pct"].rstrip("%")) for r in cpu_rows if r["pct"] != "?")
-
-                    if npu_rows:
-                        ok(f"NPU (Teflon Delegate): {len(npu_rows)} Partition(en), {npu_pct:.1f}% der Rechenzeit")
-                        for r in npu_rows:
-                            # Kürze den Namen für die Anzeige
-                            name = r["name"]
-                            if ";" in name:
-                                name = name.split(";")[0] + " ..."
-                            info(f"    {r['avg_ms']} ms ({r['pct']})  {name}")
-                    else:
-                        fail("NPU: Teflon hat keine Partitionen übernommen")
-
-                    if cpu_rows:
-                        warn(f"CPU-Fallback: {len(cpu_rows)} Op(s), {cpu_pct:.1f}% der Rechenzeit")
-                        for r in cpu_rows:
-                            info(f"    {r['node_type']}: {r['avg_ms']} ms ({r['pct']})")
-
-                    # Gesamtbewertung
-                    if npu_pct > 90:
-                        ok(f"Teflon delegiert {npu_pct:.0f}% — NPU wird voll genutzt")
-                        if npu_result["mean_ms"] > cpu_result["mean_ms"]:
-                            info("NPU trotzdem langsamer als CPU — Rocket-Treiber noch in Entwicklung")
-                    elif npu_pct > 50:
-                        warn(f"Teflon delegiert nur {npu_pct:.0f}% — CPU-Fallback bremst")
-                    elif npu_pct > 0:
-                        warn(f"Teflon delegiert nur {npu_pct:.0f}% — kaum NPU-Nutzung")
-                    # else: already reported "keine Partitionen"
-                else:
-                    warn("benchmark_model Output konnte nicht geparst werden")
-                    info("Manuell prüfen:")
-                    info(f"  TEFLON_DEBUG=1 ROCKET_DEBUG=1 benchmark_model \\")
-                    info(f"    --graph={model_path} \\")
-                    info(f"    --external_delegate_path={teflon_path} \\")
-                    info("    --enable_op_profiling=true")
-            else:
-                warn("benchmark_model nicht verfügbar — kein Per-Op-Profiling möglich")
-                info("Installation:")
-                info("  wget -O /usr/local/bin/benchmark_model \\")
-                info(
-                    "    https://storage.googleapis.com/tensorflow-nightly-public/prod/tensorflow/release/lite/tools/nightly/latest/linux_aarch64_benchmark_model"
-                )
-                info("  chmod +x /usr/local/bin/benchmark_model")
+            _print_partition_trace(partition_info, npu_result, cpu_result)
     else:
         warn("Teflon delegate not available — skipping NPU benchmark")
         info("Only CPU results available")
