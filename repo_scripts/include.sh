@@ -4,6 +4,9 @@ DOCKER_PASSWORD="someweirdpassword"
 DOCKER_TOKENUSER="dockerhubtokenuser"
 DOCKER_TOKEN="dockerhubtoken"
 
+REMOTE_ARM64_CONNECTION=""
+REMOTE_ARM64_SSH_IDENTITY=""
+
 # echo \$0 in include.sh: $0
 
 declare -a include_local_sh
