@@ -314,10 +314,12 @@ Rebuilds initramfs with `update-initramfs -u -k all`, then verifies that `lvm`, 
 
 1. `lvm vgchange -ay` — activate VG
 2. `e2fsck -f -y` — filesystem check
-3. `resize2fs` to target minus buffer
-4. `lvreduce --force` (on failure: `resize2fs` rollback, `exit 0` to continue boot)
-5. `resize2fs` — expand filesystem to fill LV
+3. `resize2fs -f` to target minus buffer (`-f` forces past `needs_recovery` journal flag, safe after `e2fsck`)
+4. `lvreduce --force` (on failure: `resize2fs -f` rollback, `exit 0` to continue boot)
+5. `resize2fs -f` — expand filesystem to fill LV
 6. Self-destruct: mounts root, removes hook + premount script, writes log to `/var/log/lv-shrink-initrd.log`
+
+All critical commands (`e2fsck`, `resize2fs`, `lvreduce`) redirect stderr to the log file for post-boot debugging.
 
 **Post-boot verification:**
 
@@ -737,6 +739,14 @@ Full run of `luks_encrypt.sh` on a Rock 5B with NVMe migration, LUKS2 + LVM + cl
 ![cryptsetup luksDump — LUKS2 header, keyslots, segments](Bildschirmfoto_2026-02-14_20-13-06_blurred.png)
 
 ![cryptsetup luksDump — keyslot digests and token details](Bildschirmfoto_2026-02-14_20-13-28_blurred.png)
+
+## Screenshots — LV Shrink via initrd (Rock 5B, LUKS + LVM)
+
+`lv_shrink.sh` initrd path on a Rock 5B — shrinking root LV from 464G to 50G on a LUKS-encrypted NVMe (clevis/tang auto-unlock). Shows LUKS wait, e2fsck, resize2fs, lvreduce, expand, and self-destruct. Sensitive data redacted with `blurimage.py`.
+
+### Successful initrd shrink — full boot log
+
+![lv_shrink.sh initrd run — LUKS decrypt, e2fsck, resize2fs -f, lvreduce, expand, self-destruct, boot](Bildschirmfoto_2026-02-17_11-20-43C_blurred.png)
 
 ---
 

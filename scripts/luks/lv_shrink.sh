@@ -460,12 +460,12 @@ else
   STEP_NUM=$((STEP_NUM + 1))
   echo "    ${STEP_NUM}. e2fsck -f -y $TARGET_DEV"
   STEP_NUM=$((STEP_NUM + 1))
-  echo "    ${STEP_NUM}. resize2fs $TARGET_DEV ${FS_TARGET_MB}M"
+  echo "    ${STEP_NUM}. resize2fs -f $TARGET_DEV ${FS_TARGET_MB}M"
   STEP_NUM=$((STEP_NUM + 1))
   echo "    ${STEP_NUM}. lvreduce --force -L ${TARGET_SIZE_MB}M $TARGET_DEV"
   echo "       (on failure: resize2fs rollback, continue boot)"
   STEP_NUM=$((STEP_NUM + 1))
-  echo "    ${STEP_NUM}. resize2fs $TARGET_DEV  (expand FS to fill LV)"
+  echo "    ${STEP_NUM}. resize2fs -f $TARGET_DEV  (expand FS to fill LV)"
   STEP_NUM=$((STEP_NUM + 1))
   echo "    ${STEP_NUM}. Self-destruct (remove initramfs hooks)"
   STEP_NUM=$((STEP_NUM + 1))
@@ -534,11 +534,18 @@ if [ -n "\${LUKS_MAPPER}" ]; then
 fi
 
 lvm vgchange -ay "\${VG_NAME}"
-e2fsck -f -y "\${TARGET_DEV}" || true
-resize2fs "\${TARGET_DEV}" "\${FS_TARGET_MB}M"
-lvreduce --force -L "\${TARGET_SIZE_MB}M" "\${TARGET_DEV}" || { resize2fs "\${TARGET_DEV}"; exit 0; }
-e2fsck -f -y "\${TARGET_DEV}" || true
-resize2fs "\${TARGET_DEV}"
+e2fsck -f -y "\${TARGET_DEV}" 2>> "\${RUN_LOG}" || true
+if ! resize2fs -f "\${TARGET_DEV}" "\${FS_TARGET_MB}M" 2>> "\${RUN_LOG}"; then
+  log_msg "resize2fs shrink FAILED — aborting, continuing boot"
+  exit 0
+fi
+if ! lvm lvreduce --force -L "\${TARGET_SIZE_MB}M" "\${TARGET_DEV}" 2>> "\${RUN_LOG}"; then
+  log_msg "lvreduce FAILED — rolling back filesystem"
+  resize2fs -f "\${TARGET_DEV}" 2>> "\${RUN_LOG}" || true
+  exit 0
+fi
+e2fsck -f -y "\${TARGET_DEV}" 2>> "\${RUN_LOG}" || true
+resize2fs -f "\${TARGET_DEV}" 2>> "\${RUN_LOG}"
 
 # Self-destruct
 TMPROOT=\$(mktemp -d)
@@ -648,27 +655,27 @@ lvm vgchange -ay "\${VG_NAME}"
 
 # Step 2: fsck
 log_msg "Running e2fsck on \${TARGET_DEV}..."
-e2fsck -f -y "\${TARGET_DEV}" || true
+e2fsck -f -y "\${TARGET_DEV}" 2>> "\${RUN_LOG}" || true
 
-# Step 3: Shrink filesystem
+# Step 3: Shrink filesystem (with -f to force past needs_recovery flag)
 log_msg "Shrinking filesystem to \${FS_TARGET_MB}M..."
-if ! resize2fs "\${TARGET_DEV}" "\${FS_TARGET_MB}M"; then
+if ! resize2fs -f "\${TARGET_DEV}" "\${FS_TARGET_MB}M" 2>> "\${RUN_LOG}"; then
   log_msg "resize2fs shrink FAILED — aborting, continuing boot"
   exit 0
 fi
 
 # Step 4: Reduce LV
 log_msg "Reducing LV to \${TARGET_SIZE_MB}M..."
-if ! lvreduce --force -L "\${TARGET_SIZE_MB}M" "\${TARGET_DEV}"; then
+if ! lvm lvreduce --force -L "\${TARGET_SIZE_MB}M" "\${TARGET_DEV}" 2>> "\${RUN_LOG}"; then
   log_msg "lvreduce FAILED — rolling back filesystem"
-  resize2fs "\${TARGET_DEV}" || true
+  resize2fs -f "\${TARGET_DEV}" 2>> "\${RUN_LOG}" || true
   exit 0
 fi
 
 # Step 5: Expand filesystem to fill LV (remove buffer)
 log_msg "Expanding filesystem to fill LV..."
-e2fsck -f -y "\${TARGET_DEV}" || true
-resize2fs "\${TARGET_DEV}"
+e2fsck -f -y "\${TARGET_DEV}" 2>> "\${RUN_LOG}" || true
+resize2fs -f "\${TARGET_DEV}" 2>> "\${RUN_LOG}"
 
 # Step 6: Self-destruct — mount root, remove hooks
 log_msg "Self-destructing hooks..."
