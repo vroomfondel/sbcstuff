@@ -27,7 +27,7 @@ MIN_LV_SIZE_MB=512             # Minimum LV size after shrink (MiB)
 FS_SHRINK_BUFFER_MB=64         # Safety buffer: filesystem is shrunk this much smaller than LV target
 HOOK_FILE="/etc/initramfs-tools/hooks/lv-shrink"
 PREMOUNT_FILE="/etc/initramfs-tools/scripts/local-premount/lv-shrink"
-LOG_FILE="/var/log/lv-shrink-initrd.log"
+LOG_FILE="/run/lv-shrink-initrd.log"
 
 # --- Colors ---
 GREEN='\033[0;32m'
@@ -72,7 +72,7 @@ if [ "$EUID" -ne 0 ]; then
   fail "This script must be run as root (sudo)."
 fi
 
-REQUIRED_CMDS=(lvs blkid findmnt e2fsck resize2fs lvreduce update-initramfs)
+REQUIRED_CMDS=(lvs blkid findmnt e2fsck resize2fs lvreduce lvm update-initramfs lsinitramfs)
 for cmd in "${REQUIRED_CMDS[@]}"; do
   if ! command -v "$cmd" &>/dev/null; then
     fail "Required command not found: $cmd"
@@ -110,8 +110,8 @@ while IFS='|' read -r lv_name vg_name lv_size_raw; do
 
   LV_DEV="/dev/${vg_name}/${lv_name}"
 
-  # Get mount point
-  MOUNTPOINT=$(findmnt -n -o TARGET "$LV_DEV" 2>/dev/null || true)
+  # Get mount points (may be multiple, e.g. / and /var/log.hdd via bind mounts)
+  MOUNTPOINTS=$(findmnt -n -o TARGET "$LV_DEV" 2>/dev/null | xargs echo || true)
 
   # Get filesystem type
   FSTYPE=$(blkid -s TYPE -o value "$LV_DEV" 2>/dev/null || true)
@@ -120,7 +120,7 @@ while IFS='|' read -r lv_name vg_name lv_size_raw; do
   LV_LIST+=("${lv_name}|${vg_name}|${LV_DEV}")
   DISPLAY_LINE="  ${IDX}) ${LV_DEV} (${lv_size_raw})"
   [ -n "$FSTYPE" ] && DISPLAY_LINE+="  fs=${FSTYPE}"
-  [ -n "$MOUNTPOINT" ] && DISPLAY_LINE+="  mounted=${MOUNTPOINT}"
+  [ -n "$MOUNTPOINTS" ] && DISPLAY_LINE+="  mounted=${MOUNTPOINTS}"
   LV_DISPLAY+=("$DISPLAY_LINE")
 done < <(lvs --noheadings --separator '|' -o lv_name,vg_name,lv_size --units m 2>/dev/null)
 
@@ -148,11 +148,51 @@ IFS='|' read -r _SEL_LV_NAME SEL_VG_NAME TARGET_DEV <<< "${LV_LIST[$((LV_SEL - 1
 info "Selected: $TARGET_DEV"
 
 # =====================================================================
-# 3. Filesystem detection and mount status
+# 3. Detect LUKS layer beneath LVM
+# =====================================================================
+
+# Check if the VG's PV sits on a LUKS device (e.g., /dev/mapper/rootfs)
+PV_DEV=$(pvs --noheadings -o pv_name -S "vg_name=${SEL_VG_NAME}" 2>/dev/null | xargs)
+LUKS_MAPPER_NAME=""
+LUKS_BACKING_DEV=""
+
+if [ -n "$PV_DEV" ]; then
+  info "PV backing VG $SEL_VG_NAME: $PV_DEV"
+
+  # Check if the PV is a dm-crypt / LUKS device
+  if [[ "$PV_DEV" == /dev/mapper/* ]]; then
+    _mapper_name="${PV_DEV#/dev/mapper/}"
+    if cryptsetup status "$_mapper_name" &>/dev/null; then
+      LUKS_MAPPER_NAME="$_mapper_name"
+      LUKS_BACKING_DEV=$(cryptsetup status "$_mapper_name" 2>/dev/null | awk '/device:/{print $2}')
+      info "LUKS detected: /dev/mapper/$LUKS_MAPPER_NAME (backing: ${LUKS_BACKING_DEV:-unknown})"
+      info "The initrd shrink script will wait for LUKS decryption before proceeding"
+    fi
+  fi
+fi
+
+# =====================================================================
+# 4. Filesystem detection and mount status
 # =====================================================================
 
 FSTYPE=$(blkid -s TYPE -o value "$TARGET_DEV" 2>/dev/null || true)
-MOUNTPOINT=$(findmnt -n -o TARGET "$TARGET_DEV" 2>/dev/null || true)
+
+# Get all mount points for this device (may be multiple, e.g. / and bind mounts)
+# Use the first mount point for df; track if / is among them for root detection
+MOUNTPOINTS_ALL=()
+while IFS= read -r mp; do
+  mp=$(echo "$mp" | xargs)
+  [ -n "$mp" ] && MOUNTPOINTS_ALL+=("$mp")
+done < <(findmnt -n -o TARGET "$TARGET_DEV" 2>/dev/null || true)
+
+MOUNTPOINT=""
+IS_ROOT=false
+if [ ${#MOUNTPOINTS_ALL[@]} -gt 0 ]; then
+  MOUNTPOINT="${MOUNTPOINTS_ALL[0]}"
+  for mp in "${MOUNTPOINTS_ALL[@]}"; do
+    [ "$mp" = "/" ] && IS_ROOT=true
+  done
+fi
 
 if [ "$FSTYPE" != "ext4" ]; then
   fail "Only ext4 filesystems are supported for shrinking (found: ${FSTYPE:-unknown}).
@@ -169,9 +209,13 @@ info "Current LV size: ${CURRENT_SIZE_MB} MiB"
 if [ -n "$MOUNTPOINT" ]; then
   USED_KB=$(df --output=used "$MOUNTPOINT" 2>/dev/null | tail -1 | xargs)
   USED_MB=$((USED_KB / 1024))
-  info "Mounted at: $MOUNTPOINT (${USED_MB} MiB used)"
+  if [ ${#MOUNTPOINTS_ALL[@]} -gt 1 ]; then
+    info "Mounted at: ${MOUNTPOINTS_ALL[*]} (${USED_MB} MiB used)"
+  else
+    info "Mounted at: $MOUNTPOINT (${USED_MB} MiB used)"
+  fi
 
-  if [ "$MOUNTPOINT" = "/" ]; then
+  if [ "$IS_ROOT" = true ]; then
     info "This is the root filesystem"
   fi
 else
@@ -290,14 +334,14 @@ USE_INITRD=false
 if [ -z "$MOUNTPOINT" ]; then
   # Not mounted — direct offline shrink
   info "Filesystem is not mounted — using direct offline shrink (Path A)"
-elif [ "$MOUNTPOINT" = "/" ]; then
+elif [ "$IS_ROOT" = true ]; then
   # Root filesystem — must use initrd
   info "Root filesystem — using initrd approach (Path B)"
   USE_INITRD=true
 else
   # Mounted but not root — ask user
   echo ""
-  echo "The filesystem is mounted at $MOUNTPOINT."
+  echo "The filesystem is mounted at ${MOUNTPOINTS_ALL[*]}."
   echo "  1) Unmount and shrink directly (requires no processes using $MOUNTPOINT)"
   echo "  2) Use initrd approach (shrink at next boot)"
   echo ""
@@ -397,19 +441,35 @@ else
   echo -e "${YELLOW}Summary — initrd Shrink (at next boot):${NC}"
   echo "  LV:            $TARGET_DEV"
   echo "  VG:            $SEL_VG_NAME"
+  if [ -n "$LUKS_MAPPER_NAME" ]; then
+  echo "  LUKS:          /dev/mapper/$LUKS_MAPPER_NAME (backing: ${LUKS_BACKING_DEV:-unknown})"
+  echo "                 Premount script will wait for LUKS decryption (PREREQ=cryptroot)"
+  fi
   echo "  Current size:  ${CURRENT_SIZE_MB} MiB"
   echo "  Target size:   ${TARGET_SIZE_MB} MiB"
   echo "  FS target:     ${FS_TARGET_MB} MiB (with ${FS_SHRINK_BUFFER_MB} MiB buffer)"
   echo ""
   echo "  The following will happen at next boot (in initramfs):"
-  echo "    1. Activate VG ($SEL_VG_NAME)"
-  echo "    2. e2fsck -f -y $TARGET_DEV"
-  echo "    3. resize2fs $TARGET_DEV ${FS_TARGET_MB}M"
-  echo "    4. lvreduce --force -L ${TARGET_SIZE_MB}M $TARGET_DEV"
+  STEP_NUM=0
+  if [ -n "$LUKS_MAPPER_NAME" ]; then
+  STEP_NUM=$((STEP_NUM + 1))
+  echo "    ${STEP_NUM}. Wait for LUKS decryption (/dev/mapper/$LUKS_MAPPER_NAME, up to 60s)"
+  fi
+  STEP_NUM=$((STEP_NUM + 1))
+  echo "    ${STEP_NUM}. Activate VG ($SEL_VG_NAME)"
+  STEP_NUM=$((STEP_NUM + 1))
+  echo "    ${STEP_NUM}. e2fsck -f -y $TARGET_DEV"
+  STEP_NUM=$((STEP_NUM + 1))
+  echo "    ${STEP_NUM}. resize2fs $TARGET_DEV ${FS_TARGET_MB}M"
+  STEP_NUM=$((STEP_NUM + 1))
+  echo "    ${STEP_NUM}. lvreduce --force -L ${TARGET_SIZE_MB}M $TARGET_DEV"
   echo "       (on failure: resize2fs rollback, continue boot)"
-  echo "    5. resize2fs $TARGET_DEV  (expand FS to fill LV)"
-  echo "    6. Self-destruct (remove initramfs hooks)"
-  echo "    7. Log results to $LOG_FILE"
+  STEP_NUM=$((STEP_NUM + 1))
+  echo "    ${STEP_NUM}. resize2fs $TARGET_DEV  (expand FS to fill LV)"
+  STEP_NUM=$((STEP_NUM + 1))
+  echo "    ${STEP_NUM}. Self-destruct (remove initramfs hooks)"
+  STEP_NUM=$((STEP_NUM + 1))
+  echo "    ${STEP_NUM}. Log results to $LOG_FILE"
   echo ""
 
   if [ "$DRY_RUN" = true ]; then
@@ -429,6 +489,14 @@ copy_exec /sbin/blkid /sbin
 copy_exec /sbin/lvm /sbin
 DRY_HOOKEOF
 
+    # Determine prereqs for dry-run display
+    _DRY_PREREQ=""
+    _DRY_LUKS_MAPPER=""
+    if [ -n "$LUKS_MAPPER_NAME" ]; then
+      _DRY_PREREQ="cryptroot"
+      _DRY_LUKS_MAPPER="$LUKS_MAPPER_NAME"
+    fi
+
     echo ""
     echo -e "${CYAN}--- Premount script: $PREMOUNT_FILE ---${NC}"
     cat << DRY_SCRIPTEOF
@@ -436,7 +504,7 @@ DRY_HOOKEOF
 # One-shot LV shrink — runs in initramfs before root is mounted.
 # Self-destructs after execution.
 
-PREREQ=""
+PREREQ="${_DRY_PREREQ}"
 prereqs() { echo "\$PREREQ"; }
 case \$1 in
 prereqs) prereqs; exit 0;;
@@ -446,11 +514,24 @@ TARGET_DEV="${TARGET_DEV}"
 VG_NAME="${SEL_VG_NAME}"
 FS_TARGET_MB=${FS_TARGET_MB}
 TARGET_SIZE_MB=${TARGET_SIZE_MB}
+LUKS_MAPPER="${_DRY_LUKS_MAPPER}"
 
-log_msg() { echo "lv-shrink: \$*"; }
+RUN_LOG="${LOG_FILE}"
+log_msg() { echo "lv-shrink: \$*"; echo "\$(date '+%Y-%m-%d %H:%M:%S'): \$*" >> "\${RUN_LOG}" 2>/dev/null || true; }
 trap 'log_msg "ERROR at line \$LINENO — continuing boot"; exit 0' ERR
 
 log_msg "Starting LV shrink: \${TARGET_DEV} → \${TARGET_SIZE_MB}M"
+
+# Wait for LUKS decryption (if applicable)
+if [ -n "\${LUKS_MAPPER}" ]; then
+  log_msg "Waiting for LUKS device /dev/mapper/\${LUKS_MAPPER}..."
+  WAIT_COUNT=0; MAX_WAIT=60
+  while [ ! -b "/dev/mapper/\${LUKS_MAPPER}" ] && [ "\$WAIT_COUNT" -lt "\$MAX_WAIT" ]; do
+    sleep 1; WAIT_COUNT=\$((WAIT_COUNT + 1))
+  done
+  [ -b "/dev/mapper/\${LUKS_MAPPER}" ] || { log_msg "LUKS not available — aborting"; exit 0; }
+  log_msg "LUKS device available after \${WAIT_COUNT}s"
+fi
 
 lvm vgchange -ay "\${VG_NAME}"
 e2fsck -f -y "\${TARGET_DEV}" || true
@@ -459,15 +540,16 @@ lvreduce --force -L "\${TARGET_SIZE_MB}M" "\${TARGET_DEV}" || { resize2fs "\${TA
 e2fsck -f -y "\${TARGET_DEV}" || true
 resize2fs "\${TARGET_DEV}"
 
-# Self-destruct + log
-mkdir -p /tmp/lv-shrink-root
-mount "\${TARGET_DEV}" /tmp/lv-shrink-root
-rm -f "/tmp/lv-shrink-root${HOOK_FILE}"
-rm -f "/tmp/lv-shrink-root${PREMOUNT_FILE}"
-echo "\$(date): LV shrink of \${TARGET_DEV} to \${TARGET_SIZE_MB}M completed successfully" \
-  >> "/tmp/lv-shrink-root${LOG_FILE}"
-umount /tmp/lv-shrink-root
-rmdir /tmp/lv-shrink-root 2>/dev/null || true
+# Self-destruct
+TMPROOT=\$(mktemp -d)
+if mount "\${TARGET_DEV}" "\${TMPROOT}"; then
+  rm -f "\${TMPROOT}${HOOK_FILE}" "\${TMPROOT}${PREMOUNT_FILE}"
+  log_msg "Removed initramfs hooks from root filesystem"
+  umount "\${TMPROOT}"
+else
+  log_msg "WARNING: Could not mount root for self-destruct"
+fi
+rmdir "\${TMPROOT}" 2>/dev/null || true
 
 log_msg "LV shrink complete!"
 exit 0
@@ -505,12 +587,21 @@ HOOKEOF
   # --- Install local-premount script ---
   info "Creating local-premount script..."
 
+  # Determine prereqs for the premount script
+  if [ -n "$LUKS_MAPPER_NAME" ]; then
+    PREMOUNT_PREREQ="cryptroot"
+    PREMOUNT_LUKS_MAPPER="$LUKS_MAPPER_NAME"
+  else
+    PREMOUNT_PREREQ=""
+    PREMOUNT_LUKS_MAPPER=""
+  fi
+
   cat > "$PREMOUNT_FILE" << SCRIPTEOF
 #!/bin/sh
 # One-shot LV shrink — runs in initramfs before root is mounted.
 # Self-destructs after successful execution.
 
-PREREQ=""
+PREREQ="${PREMOUNT_PREREQ}"
 prereqs() { echo "\$PREREQ"; }
 case \$1 in
 prereqs) prereqs; exit 0;;
@@ -521,13 +612,35 @@ TARGET_DEV="${TARGET_DEV}"
 VG_NAME="${SEL_VG_NAME}"
 FS_TARGET_MB=${FS_TARGET_MB}
 TARGET_SIZE_MB=${TARGET_SIZE_MB}
+LUKS_MAPPER="${PREMOUNT_LUKS_MAPPER}"
 
-log_msg() { echo "lv-shrink: \$*"; }
+RUN_LOG="${LOG_FILE}"
+
+log_msg() {
+  echo "lv-shrink: \$*"
+  echo "\$(date '+%Y-%m-%d %H:%M:%S'): \$*" >> "\${RUN_LOG}" 2>/dev/null || true
+}
 
 # All errors exit 0 to never block boot
 trap 'log_msg "ERROR at line \$LINENO — continuing boot"; exit 0' ERR
 
 log_msg "Starting LV shrink: \${TARGET_DEV} → \${TARGET_SIZE_MB}M"
+
+# Step 0: Wait for LUKS decryption (if LV sits on a LUKS device)
+if [ -n "\${LUKS_MAPPER}" ]; then
+  log_msg "Waiting for LUKS device /dev/mapper/\${LUKS_MAPPER}..."
+  WAIT_COUNT=0
+  MAX_WAIT=60
+  while [ ! -b "/dev/mapper/\${LUKS_MAPPER}" ] && [ "\$WAIT_COUNT" -lt "\$MAX_WAIT" ]; do
+    sleep 1
+    WAIT_COUNT=\$((WAIT_COUNT + 1))
+  done
+  if [ ! -b "/dev/mapper/\${LUKS_MAPPER}" ]; then
+    log_msg "LUKS device /dev/mapper/\${LUKS_MAPPER} not available after \${MAX_WAIT}s — aborting shrink"
+    exit 0
+  fi
+  log_msg "LUKS device available after \${WAIT_COUNT}s"
+fi
 
 # Step 1: Activate LVM
 log_msg "Activating VG \${VG_NAME}..."
@@ -557,21 +670,17 @@ log_msg "Expanding filesystem to fill LV..."
 e2fsck -f -y "\${TARGET_DEV}" || true
 resize2fs "\${TARGET_DEV}"
 
-# Step 6: Self-destruct — mount root, remove hooks, write log
+# Step 6: Self-destruct — mount root, remove hooks
 log_msg "Self-destructing hooks..."
 TMPROOT=\$(mktemp -d)
-mount "\${TARGET_DEV}" "\${TMPROOT}"
-
-rm -f "\${TMPROOT}${HOOK_FILE}"
-rm -f "\${TMPROOT}${PREMOUNT_FILE}"
-log_msg "Removed initramfs hooks"
-
-# Write log
-mkdir -p "\${TMPROOT}$(dirname "$LOG_FILE")"
-echo "\$(date '+%Y-%m-%d %H:%M:%S'): LV shrink of \${TARGET_DEV} to \${TARGET_SIZE_MB}M completed successfully" \
-  >> "\${TMPROOT}${LOG_FILE}"
-
-umount "\${TMPROOT}"
+if mount "\${TARGET_DEV}" "\${TMPROOT}"; then
+  rm -f "\${TMPROOT}${HOOK_FILE}"
+  rm -f "\${TMPROOT}${PREMOUNT_FILE}"
+  log_msg "Removed initramfs hooks from root filesystem"
+  umount "\${TMPROOT}"
+else
+  log_msg "WARNING: Could not mount root for self-destruct — hooks remain, remove manually"
+fi
 rmdir "\${TMPROOT}" 2>/dev/null || true
 
 log_msg "LV shrink complete!"
@@ -584,6 +693,28 @@ SCRIPTEOF
   info "Rebuilding initramfs..."
   update-initramfs -u -k all
   ok "Initramfs rebuilt"
+
+  # --- Verify tools are in the initrd ---
+  info "Verifying initrd contents..."
+  INITRD_FILE=$(find /boot -name 'initrd.img-*' -o -name 'initramfs*' 2>/dev/null | sort -V | tail -1)
+  if [ -n "$INITRD_FILE" ]; then
+    INITRD_CONTENTS=$(lsinitramfs "$INITRD_FILE" 2>/dev/null || true)
+    MISSING_TOOLS=()
+    for tool in lvm e2fsck resize2fs; do
+      if ! echo "$INITRD_CONTENTS" | grep -q "/$tool\$"; then
+        MISSING_TOOLS+=("$tool")
+      fi
+    done
+    if [ ${#MISSING_TOOLS[@]} -eq 0 ]; then
+      ok "All required tools found in initrd ($INITRD_FILE)"
+    else
+      warn "Tools NOT found in initrd: ${MISSING_TOOLS[*]}"
+      warn "The shrink may fail at boot. Check hook output and rebuild with:"
+      warn "  update-initramfs -u -k all"
+    fi
+  else
+    warn "Could not locate initrd file for verification"
+  fi
 
   # --- Done ---
   echo ""
@@ -599,6 +730,7 @@ SCRIPTEOF
   echo "     lvs                                    — check new LV size"
   echo "     df -h                                  — check filesystem size"
   echo "     cat $LOG_FILE   — check shrink log"
+  echo "     (log is on tmpfs — save it before next reboot)"
   echo ""
   echo -e "${CYAN}Installed hooks (self-destruct after successful shrink):${NC}"
   echo "  $HOOK_FILE"

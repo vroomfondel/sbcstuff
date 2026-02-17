@@ -15,6 +15,7 @@ These scripts were extracted from a larger infrastructure repo because the Rock 
 | `scripts/luks/luks_prepare.sh` | Prepare a board for LUKS encryption (packages, initramfs, boot config) | Target board (RPi / Rock 5B) |
 | `scripts/luks/luks_encrypt.sh` | Encrypt root partition with LUKS + clevis/tang auto-unlock | External machine (RPi) or target board (Armbian NVMe/USB) or SD-booted board against eMMC |
 | `scripts/luks/luks_boot_split.sh` | Split `/boot` into a separate partition (required for Armbian in-place encryption) | Target board (on-board mode) or external machine (external mode) |
+| `scripts/luks/lv_shrink.sh` | Interactively shrink an LVM Logical Volume (ext4, offline or via initrd) | Target board |
 | `scripts/luks/setup_clevis_tang.sh` | (Re-)bind clevis/tang NBDE on an already-encrypted LUKS device | Target board (already encrypted) |
 | `scripts/luks/tang_check_connection.sh` | Test clevis/tang connectivity and decryption on a LUKS device | Target board (already encrypted) |
 | `scripts/luks/initramfs_local-bottom_cleanup-netplan` | Initramfs hook: removes stale netplan YAML from boot-time DHCP | Automatisch im Initramfs (nicht manuell) |
@@ -256,6 +257,76 @@ Performs the split directly on an unmounted device — no initramfs hooks or reb
 4. Shows final partition layout
 
 After external split, insert the SD card back into the board. `/boot` will mount automatically on boot. Run `luks_prepare.sh` next.
+
+#### lv_shrink.sh
+
+Interactive script for shrinking LVM Logical Volumes with ext4 filesystems. ext4 does not support online shrinking — for mounted/root partitions, the script installs initramfs hooks that perform the shrink offline at next boot (same pattern as `luks_boot_split.sh`).
+
+**Two paths:**
+
+- **Path A — Direct offline shrink** (ext4, not mounted): `e2fsck` → `resize2fs` → `lvreduce` → `resize2fs` (expand to fill LV)
+- **Path B — initrd approach** (mounted or root LVs): installs initramfs hooks, shrink happens at next boot before root is mounted
+
+**Usage:**
+
+```bash
+sudo ./lv_shrink.sh              # interactive mode
+sudo ./lv_shrink.sh --dry-run    # show what would be done (both paths)
+sudo ./lv_shrink.sh -h           # show help
+```
+
+**CLI flags:**
+
+| Flag | Description |
+|------|-------------|
+| `--dry-run` | Show all commands/hook content without making changes |
+| `-h`, `--help` | Show help and exit |
+
+**What it does (interactive flow):**
+
+1. Lists all Logical Volumes with size, filesystem type, and mount points (handles multiple mount points, e.g., `/` + bind mounts)
+2. Prompts for LV selection (bounds-checked numbered menu)
+3. Validates filesystem: only ext4 supported (fails with hint for XFS/btrfs)
+4. Prompts for target size — absolute (`20G`, `10240M`) or reduction (`-5G`, `-2048M`). Validates against minimum size (512 MiB), used space, and warns when free space after shrink is tight (<512 MiB)
+5. Decides path based on mount status:
+   - Not mounted → Path A (direct)
+   - Root (`/`) → Path B (initrd, automatic)
+   - Mounted, not root → user chooses: unmount or initrd (falls back to initrd if unmount fails)
+6. Shows summary and requires `YES` confirmation
+
+**Path A — Direct offline shrink:**
+
+1. `e2fsck -f -y` — filesystem check
+2. `resize2fs` to target minus 64 MiB buffer
+3. `lvreduce --force` to target size (on failure: `resize2fs` rollback to restore full size)
+4. `resize2fs` — expand filesystem to fill LV (removes buffer)
+
+**Path B — initrd approach:**
+
+Installs two files:
+
+- **Hook** (`/etc/initramfs-tools/hooks/lv-shrink`): `copy_exec` for `e2fsck`, `resize2fs`, `blkid`, `lvm`
+- **local-premount script** (`/etc/initramfs-tools/scripts/local-premount/lv-shrink`): baked-in values (`TARGET_DEV`, `VG_NAME`, `FS_TARGET_MB`, `TARGET_SIZE_MB`), error trap that exits 0 (never blocks boot)
+
+Rebuilds initramfs with `update-initramfs -u -k all`, then verifies that `lvm`, `e2fsck`, and `resize2fs` are present in the initrd via `lsinitramfs`.
+
+**At next boot (in initramfs):**
+
+1. `lvm vgchange -ay` — activate VG
+2. `e2fsck -f -y` — filesystem check
+3. `resize2fs` to target minus buffer
+4. `lvreduce --force` (on failure: `resize2fs` rollback, `exit 0` to continue boot)
+5. `resize2fs` — expand filesystem to fill LV
+6. Self-destruct: mounts root, removes hook + premount script, writes log to `/var/log/lv-shrink-initrd.log`
+
+**Post-boot verification:**
+
+```bash
+lvs                                           # check new LV size
+df -h                                         # check filesystem size
+cat /var/log/lv-shrink-initrd.log             # check shrink log
+ls /etc/initramfs-tools/hooks/lv-shrink       # should be gone (self-destruct)
+```
 
 #### luks_encrypt.sh
 
