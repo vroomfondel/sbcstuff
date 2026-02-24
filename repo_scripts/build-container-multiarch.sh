@@ -4,7 +4,6 @@ set -euo pipefail
 #=============================================================================
 # CONFIGURATION
 #=============================================================================
-
 readonly SCRIPT_DIR="$(dirname "$(realpath "$0")")"
 readonly INCLUDE_SH="include.sh"
 readonly PODMAN_VM_INIT_DISK_SIZE=100
@@ -12,8 +11,8 @@ readonly PYTHON_VERSION=3.14
 readonly DEBIAN_VERSION=slim-trixie
 readonly DOCKER_IMAGE="docker.io/xomoxcc/sbcstuff:python-${PYTHON_VERSION}-${DEBIAN_VERSION}"
 readonly DOCKER_IMAGE_LATEST="${DOCKER_IMAGE%:*}:latest"
+
 readonly PLATFORMS=("linux/amd64" "linux/arm64")
-readonly DOCKERFILE=../Dockerfile
 readonly DOCKERFILE=../Dockerfile
 readonly DOCKER_BUILD_CONTEXT=$(dirname "$(realpath --relative-to="${SCRIPT_DIR}" "${SCRIPT_DIR}/${DOCKERFILE}")")
 REMOTE_ARM64_CONNECTION="${REMOTE_ARM64_CONNECTION:-}"  # e.g. "user@rock5b"; made readonly after sourcing include.sh
@@ -35,6 +34,9 @@ readonly BUILD_BASE_ARGS=(
 # podman --connection podman-machine-default system prune -a
 # podman --connection podman-machine-default system df
 # podman machine inspect podman-machine-default | grep -i disk
+
+
+readonly BUILD_SCRIPT_VERSION="2026-02-23_11:11:11"
 
 # Runtime state
 PODMAN_VM_STARTED=0
@@ -196,9 +198,8 @@ build_with_docker() {
   printf -v platforms_csv '%s,' "${PLATFORMS[@]}"
   platforms_csv="${platforms_csv%,}"
 
-  # Add latest tag if not already latest
   local -a build_args=("${BUILD_BASE_ARGS[@]}")
-  if [[ "${DOCKER_IMAGE}" != *:latest ]]; then
+  if [[ -n "${DOCKER_IMAGE_LATEST}" && "${DOCKER_IMAGE}" != *:latest ]]; then
     build_args+=("-t" "${DOCKER_IMAGE_LATEST}")
   fi
 
@@ -219,6 +220,13 @@ build_with_podman() {
   podman manifest rm "${DOCKER_IMAGE}" 2>/dev/null || true
   echo podman image rm "${DOCKER_IMAGE}"
   podman image rm "${DOCKER_IMAGE}" 2>/dev/null || true
+
+  if [[ -n "${DOCKER_IMAGE_LATEST}" && "${DOCKER_IMAGE}" != *:latest ]]; then
+    echo podman manifest rm "${DOCKER_IMAGE_LATEST}"
+    podman manifest rm "${DOCKER_IMAGE_LATEST}" 2>/dev/null || true
+    echo podman image rm "${DOCKER_IMAGE_LATEST}"
+    podman image rm "${DOCKER_IMAGE_LATEST}" 2>/dev/null || true
+  fi
 
   # Track platform-specific data
   local -a platform_tags=()
@@ -334,8 +342,7 @@ build_with_podman() {
   echo podman manifest create "${DOCKER_IMAGE}" "${platform_tags[@]}"
   podman manifest create "${DOCKER_IMAGE}" "${platform_tags[@]}"
 
-  # Tag with latest (if not already latest)
-  if [[ "${DOCKER_IMAGE}" != *:latest ]]; then
+  if [[ -n "${DOCKER_IMAGE_LATEST}" && "${DOCKER_IMAGE}" != *:latest ]]; then
     log "Tagging as latest: ${DOCKER_IMAGE_LATEST}"
     podman tag "${DOCKER_IMAGE}" "${DOCKER_IMAGE_LATEST}"
   fi
@@ -347,8 +354,7 @@ build_with_podman() {
   echo podman manifest push "${DOCKER_IMAGE}" "docker://${DOCKER_IMAGE}"
   podman manifest push "${DOCKER_IMAGE}" "docker://${DOCKER_IMAGE}"
 
-  # Push latest tag
-  if [[ "${DOCKER_IMAGE}" != *:latest ]]; then
+  if [[ -n "${DOCKER_IMAGE_LATEST}" && "${DOCKER_IMAGE}" != *:latest ]]; then
     log "Pushing as latest: ${DOCKER_IMAGE_LATEST}"
     podman manifest push "${DOCKER_IMAGE}" "docker://${DOCKER_IMAGE_LATEST}"
   fi
@@ -380,10 +386,9 @@ build_local_only() {
   esac
   local native_platform="linux/${native_arch}"
 
-  # Add latest tag if not already latest
   local -a build_args=("${BUILD_BASE_ARGS[@]}")
   build_args+=("--platform" "${native_platform}")
-  if [[ "${DOCKER_IMAGE}" != *:latest ]]; then
+  if [[ -n "${DOCKER_IMAGE_LATEST}" && "${DOCKER_IMAGE}" != *:latest ]]; then
     build_args+=("-t" "${DOCKER_IMAGE_LATEST}")
   fi
 
