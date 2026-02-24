@@ -2,54 +2,54 @@
 #
 # rock5b-usb-boot-setup.sh
 # ========================
-# Interaktives Script zum Einrichten des USB-Boots auf dem Radxa Rock 5B
-# - Prüft den aktuellen Zustand des SPI-Flash
-# - Flasht bei Bedarf einen U-Boot Bootloader auf SPI
-# - Konfiguriert die Boot-Reihenfolge (USB vor SD/eMMC)
+# Interactive script for setting up USB boot on the Radxa Rock 5B
+# - Checks the current state of the SPI flash
+# - Flashes a U-Boot bootloader to SPI if needed
+# - Configures the boot order (USB before SD/eMMC)
 #
-# Voraussetzung: Laufendes Armbian auf SD-Karte (Vendor Kernel 6.x)
-# KEIN serieller Zugang nötig.
+# Prerequisite: Running Armbian on SD card (Vendor Kernel 6.x)
+# NO serial access required.
 #
-# Aufruf: sudo bash rock5b-usb-boot-setup.sh
+# Usage: sudo bash rock5b-usb-boot-setup.sh
 #
 
 set -euo pipefail
 
 # ============================================================
-# Konfiguration
+# Configuration
 # ============================================================
-# Radxa offizielles SPI-Image (URL wird bei Bedarf heruntergeladen)
+# Radxa official SPI image (URL is downloaded if needed)
 RADXA_SPI_IMAGE_URL="https://dl.radxa.com/rock5/sw/images/loader/rock-5b/release/rock-5b-spi-image-gd1cf491-20240523.img"
 SPI_DOWNLOAD_DIR="/tmp/rock5b-spi"
 
-# DTB-Overlay-Pfad und Overlay-Namen für SPI-Flash
+# DTB overlay path and overlay names for SPI flash
 DTB_OVERLAY_DIR="/boot/dtb/rockchip/overlay"
 SPI_OVERLAY_NAMES=("rk3588-spi-flash" "rock-5b-spi-flash" "spi-flash")
 
-# Armbian SPI-Image Suchpfade
+# Armbian SPI image search paths
 ARMBIAN_SPI_CANDIDATES=(
     "/usr/lib/linux-u-boot-*/u-boot-rockchip-spi.bin"
     "/usr/lib/u-boot/rock-5b/u-boot-rockchip-spi.bin"
     "/usr/share/armbian/u-boot/rock-5b/u-boot-rockchip-spi.bin"
 )
 
-# SPI-Flash dd Block-Größe (Bytes)
+# SPI flash dd block size (bytes)
 SPI_DD_BLOCK_SIZE=4096
 
-# Boot-Reihenfolge
+# Boot order
 DEFAULT_BOOT_ORDER="mmc1 nvme mmc0 scsi usb pxe dhcp spi"
 USB_FIRST_BOOT_ORDER="usb mmc1 nvme mmc0 scsi pxe dhcp spi"
 
-# U-Boot Environment Konfiguration (Armbian Rock 5B)
-UBOOT_ENV_OFFSET="0xc00000"      # 12 MB ins 16 MB SPI
+# U-Boot environment configuration (Armbian Rock 5B)
+UBOOT_ENV_OFFSET="0xc00000"      # 12 MB into 16 MB SPI
 UBOOT_ENV_SIZE="0x20000"         # 128 KB
-UBOOT_ENV_SECTOR_SIZE="0x1000"   # 4 KB Erase-Block
+UBOOT_ENV_SECTOR_SIZE="0x1000"   # 4 KB erase block
 
-# lsblk Ausgabelimit
+# lsblk output limit
 LSBLK_DISPLAY_LIMIT=30
 
 # ============================================================
-# Farben und Hilfsfunktionen
+# Colors and helper functions
 # ============================================================
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -62,36 +62,36 @@ NC='\033[0m' # No Color
 info()    { echo -e "${BLUE}[INFO]${NC}  $*"; }
 ok()      { echo -e "${GREEN}[OK]${NC}    $*"; }
 warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; }
-err()     { echo -e "${RED}[FEHLER]${NC} $*"; }
+err()     { echo -e "${RED}[ERROR]${NC}  $*"; }
 header()  { echo -e "\n${BOLD}${CYAN}═══════════════════════════════════════════${NC}"; echo -e "${BOLD}${CYAN}  $*${NC}"; echo -e "${BOLD}${CYAN}═══════════════════════════════════════════${NC}\n"; }
 ask()     { echo -en "${YELLOW}» $* ${NC}"; }
 
 confirm() {
-    local prompt="${1:-Fortfahren?}"
-    ask "$prompt [j/N]: "
+    local prompt="${1:-Continue?}"
+    ask "$prompt [y/N]: "
     read -r answer
     [[ "$answer" =~ ^[jJyY]$ ]]
 }
 
 pause() {
     echo ""
-    ask "Weiter mit Enter..."
+    ask "Press Enter to continue..."
     read -r
 }
 
 # ============================================================
-# Root-Check
+# Root check
 # ============================================================
 if [[ $EUID -ne 0 ]]; then
-    err "Dieses Script muss als root ausgeführt werden!"
+    err "This script must be run as root!"
     echo "  → sudo bash $0"
     exit 1
 fi
 
-# grep -P (Perl-Regex) wird benötigt (z.B. für mtdinfo-Parsing)
+# grep -P (Perl regex) is required (e.g. for mtdinfo parsing)
 if ! echo "test123" | grep -oP '\K[0-9]+' &>/dev/null; then
-    err "grep unterstützt keine Perl-Regex (-P)."
-    err "Bitte GNU grep installieren: apt-get install grep"
+    err "grep does not support Perl regex (-P)."
+    err "Please install GNU grep: apt-get install grep"
     exit 1
 fi
 
@@ -107,130 +107,130 @@ cleanup() {
 trap cleanup EXIT
 
 # ============================================================
-# Board-Erkennung
+# Board detection
 # ============================================================
-header "Schritt 1: System-Check"
+header "Step 1: System check"
 
-info "Prüfe Board-Typ..."
+info "Checking board type..."
 
 BOARD_NAME=""
 if [[ -f /proc/device-tree/model ]]; then
     BOARD_NAME=$(tr -d '\0' < /proc/device-tree/model)
-    ok "Board erkannt: ${BOLD}$BOARD_NAME${NC}"
+    ok "Board detected: ${BOLD}$BOARD_NAME${NC}"
 else
-    warn "Konnte Board-Modell nicht auslesen."
+    warn "Could not read board model."
 fi
 
 if ! echo "$BOARD_NAME" | grep -qi "rock.5b\|rk3588"; then
-    warn "Dieses Script ist für den Radxa Rock 5B (RK3588) gedacht."
-    warn "Erkanntes Board: $BOARD_NAME"
-    if ! confirm "Trotzdem fortfahren?"; then
-        echo "Abgebrochen."
+    warn "This script is intended for the Radxa Rock 5B (RK3588)."
+    warn "Detected board: $BOARD_NAME"
+    if ! confirm "Continue anyway?"; then
+        echo "Aborted."
         exit 0
     fi
 fi
 
-# Kernel-Info
+# Kernel info
 info "Kernel: $(uname -r)"
-info "Architektur: $(uname -m)"
+info "Architecture: $(uname -m)"
 
 # ============================================================
-# Prüfe ob Armbian
+# Check if Armbian
 # ============================================================
 if [[ -f /etc/armbian-release ]]; then
     source /etc/armbian-release 2>/dev/null || true
-    ok "Armbian Release: ${BOARD:-unbekannt} / ${BRANCH:-unbekannt} / ${VERSION:-unbekannt}"
+    ok "Armbian release: ${BOARD:-unknown} / ${BRANCH:-unknown} / ${VERSION:-unknown}"
 else
-    warn "Keine Armbian-Release-Datei gefunden. Ist das wirklich Armbian?"
-    if ! confirm "Trotzdem fortfahren?"; then
+    warn "No Armbian release file found. Is this really Armbian?"
+    if ! confirm "Continue anyway?"; then
         exit 0
     fi
 fi
 
 # ============================================================
-# SPI-Flash Status
+# SPI flash status
 # ============================================================
-header "Schritt 2: SPI-Flash prüfen"
+header "Step 2: Check SPI flash"
 
 SPI_MTD=""
 SPI_SIZE=0
 SPI_EMPTY=true
 
-info "Suche MTD-Devices (SPI-Flash)..."
+info "Searching for MTD devices (SPI flash)..."
 
 if [[ -e /dev/mtd0 ]]; then
-    ok "/dev/mtd0 gefunden."
+    ok "/dev/mtd0 found."
 
-    # MTD-Info auslesen
+    # Read MTD info
     if [[ -f /proc/mtd ]]; then
         echo ""
-        info "MTD-Partitionen:"
+        info "MTD partitions:"
         cat /proc/mtd
         echo ""
     fi
 
     SPI_MTD="/dev/mtd0"
 
-    # Größe ermitteln
+    # Determine size
     if command -v mtdinfo &>/dev/null; then
         SPI_SIZE=$(mtdinfo /dev/mtd0 2>/dev/null | grep "Amount of eraseblocks" | head -1 | grep -oP '\(\K[0-9]+' || echo "0")
         if [[ "$SPI_SIZE" -gt 0 ]]; then
-            info "SPI-Flash Größe: ca. $((SPI_SIZE / 1024 / 1024)) MB ($SPI_SIZE Bytes)"
+            info "SPI flash size: approx. $((SPI_SIZE / 1024 / 1024)) MB ($SPI_SIZE bytes)"
         fi
     fi
 
-    # Prüfe ob SPI-Flash leer (nur 0xFF Bytes = leer)
-    info "Prüfe ob SPI-Flash Daten enthält (lese erste 4KB)..."
+    # Check if SPI flash is empty (only 0xFF bytes = empty)
+    info "Checking whether SPI flash contains data (reading first 4 KB)..."
     FIRST_BYTES=$(dd if=/dev/mtd0ro bs=$SPI_DD_BLOCK_SIZE count=1 2>/dev/null | xxd -p | tr -d '\n')
 
-    # Prüfe ob alles FF ist (= leer)
+    # Check if everything is FF (= empty)
     CLEAN_BYTES="${FIRST_BYTES//f/}"
     if [[ -z "$CLEAN_BYTES" ]]; then
         SPI_EMPTY=true
-        warn "SPI-Flash scheint LEER zu sein (nur 0xFF)."
+        warn "SPI flash appears to be EMPTY (only 0xFF)."
     else
         SPI_EMPTY=false
-        ok "SPI-Flash enthält Daten (Bootloader vorhanden)."
+        ok "SPI flash contains data (bootloader present)."
 
-        # Versuche U-Boot Signatur zu finden
+        # Try to find U-Boot signature
         if echo "$FIRST_BYTES" | grep -q "3b8cfc00\|55424f4f"; then
-            info "Erkannt: Sieht nach einem RK3588 Bootloader aus."
+            info "Detected: Looks like an RK3588 bootloader."
         fi
     fi
 else
-    warn "/dev/mtd0 nicht gefunden!"
+    warn "/dev/mtd0 not found!"
     echo ""
-    info "Mögliche Ursachen:"
-    info "  - SPI-Flash ist nicht im Device-Tree aktiviert"
-    info "  - SPI-Overlay fehlt"
+    info "Possible causes:"
+    info "  - SPI flash is not enabled in the device tree"
+    info "  - SPI overlay is missing"
     echo ""
-    info "Prüfe verfügbare Overlays..."
+    info "Checking available overlays..."
 
-    # Suche nach SPI-Flash Overlay
+    # Search for SPI flash overlay
     OVERLAY_DIR="$DTB_OVERLAY_DIR"
     if [[ -d "$OVERLAY_DIR" ]]; then
         SPI_OVERLAYS=$(find "$OVERLAY_DIR" -maxdepth 1 -type f \( -name "*spi*" -o -name "*flash*" \) 2>/dev/null || true)
         if [[ -n "$SPI_OVERLAYS" ]]; then
-            info "Gefundene SPI-Overlays:"
+            info "Found SPI overlays:"
             echo "$SPI_OVERLAYS" | while read -r f; do echo "    $f"; done
         fi
     fi
 
-    # Prüfe auch in armbianEnv.txt
+    # Also check in armbianEnv.txt
     if [[ -f /boot/armbianEnv.txt ]]; then
-        info "Aktuelle armbianEnv.txt Overlays:"
-        grep "^overlays=" /boot/armbianEnv.txt 2>/dev/null || echo "    (keine overlays gesetzt)"
+        info "Current armbianEnv.txt overlays:"
+        grep "^overlays=" /boot/armbianEnv.txt 2>/dev/null || echo "    (no overlays set)"
     fi
 
     echo ""
-    warn "Ohne MTD-Device kann der SPI-Flash nicht direkt geflasht werden."
-    info "Optionen:"
-    info "  1) SPI-Flash Overlay in /boot/armbianEnv.txt aktivieren und rebooten"
-    info "  2) Per Maskrom-Modus (USB-OTG + PC) flashen"
+    warn "Without an MTD device the SPI flash cannot be flashed directly."
+    info "Options:"
+    info "  1) Enable SPI flash overlay in /boot/armbianEnv.txt and reboot"
+    info "  2) Flash via Maskrom mode (USB-OTG + PC)"
     echo ""
 
     if [[ -f /boot/armbianEnv.txt ]]; then
-        # Versuche SPI-Flash Overlay automatisch zu aktivieren
+        # Try to enable SPI flash overlay automatically
         FOUND_SPI_OVERLAY=""
         for ov in "${SPI_OVERLAY_NAMES[@]}"; do
             if [[ -f "$OVERLAY_DIR/${ov}.dtbo" ]]; then
@@ -240,32 +240,32 @@ else
         done
 
         if [[ -n "$FOUND_SPI_OVERLAY" ]]; then
-            info "Gefundenes SPI-Overlay: $FOUND_SPI_OVERLAY"
-            if confirm "Soll das SPI-Flash Overlay aktiviert werden? (Reboot nötig)"; then
+            info "Found SPI overlay: $FOUND_SPI_OVERLAY"
+            if confirm "Enable the SPI flash overlay? (Reboot required)"; then
                 CURRENT_OVERLAYS=$(grep "^overlays=" /boot/armbianEnv.txt 2>/dev/null | cut -d= -f2 || true)
                 if echo "$CURRENT_OVERLAYS" | grep -qw "$FOUND_SPI_OVERLAY"; then
-                    ok "Overlay '$FOUND_SPI_OVERLAY' ist bereits aktiviert."
+                    ok "Overlay '$FOUND_SPI_OVERLAY' is already enabled."
                 elif [[ -n "$CURRENT_OVERLAYS" ]]; then
                     sed -i "s/^overlays=.*/overlays=$CURRENT_OVERLAYS $FOUND_SPI_OVERLAY/" /boot/armbianEnv.txt
                 else
                     echo "overlays=$FOUND_SPI_OVERLAY" >> /boot/armbianEnv.txt
                 fi
-                ok "Overlay hinzugefügt. Bitte rebooten und Script erneut starten."
+                ok "Overlay added. Please reboot and run the script again."
                 info "  → sudo reboot"
                 exit 0
             fi
         else
-            warn "Kein passendes SPI-Flash Overlay gefunden."
-            info "Versuche alternativ, ob mtdblock-Device existiert..."
+            warn "No matching SPI flash overlay found."
+            info "Trying alternatively whether mtdblock device exists..."
             if [[ -e /dev/mtdblock0 ]]; then
-                ok "/dev/mtdblock0 existiert! Fahre fort..."
+                ok "/dev/mtdblock0 exists! Continuing..."
                 SPI_MTD="/dev/mtdblock0"
             else
-                err "Kein SPI-Flash-Zugang möglich. Bitte prüfe dein Setup."
-                info "Hinweis: Manche Armbian-Images aktivieren den SPI-Flash nicht standardmäßig."
-                info "Du kannst versuchen:"
+                err "No SPI flash access possible. Please check your setup."
+                info "Note: Some Armbian images do not enable SPI flash by default."
+                info "You can try:"
                 info "  modprobe spi-rockchip-sfc"
-                info "  ... und dann das Script erneut starten."
+                info "  ... and then run the script again."
                 exit 1
             fi
         fi
@@ -275,14 +275,14 @@ fi
 pause
 
 # ============================================================
-# Schritt 3: Aktuellen Bootloader analysieren / U-Boot SPI Image beschaffen
+# Step 3: Analyse current bootloader / obtain U-Boot SPI image
 # ============================================================
-header "Schritt 3: U-Boot SPI Image"
+header "Step 3: U-Boot SPI image"
 
 UBOOT_SPI_IMG=""
 
-# Prüfe ob Armbian ein SPI-Image mitliefert
-info "Suche vorhandene U-Boot SPI-Images..."
+# Check whether Armbian ships an SPI image
+info "Searching for existing U-Boot SPI images..."
 
 shopt -s nullglob
 for pattern in "${ARMBIAN_SPI_CANDIDATES[@]}"; do
@@ -291,7 +291,7 @@ for pattern in "${ARMBIAN_SPI_CANDIDATES[@]}"; do
     for candidate in "${candidates[@]}"; do
         if [[ -f "$candidate" ]]; then
             UBOOT_SPI_IMG="$candidate"
-            ok "Armbian SPI-Image gefunden: $UBOOT_SPI_IMG"
+            ok "Armbian SPI image found: $UBOOT_SPI_IMG"
             ls -lh "$UBOOT_SPI_IMG"
             break 2
         fi
@@ -300,141 +300,141 @@ done
 shopt -u nullglob
 
 if [[ -z "$UBOOT_SPI_IMG" ]]; then
-    warn "Kein vorinstalliertes SPI-Image gefunden."
+    warn "No pre-installed SPI image found."
     echo ""
-    info "Optionen:"
-    info "  1) Radxa offizielles SPI-Image herunterladen"
-    info "  2) Eigenes Image angeben (Pfad)"
-    info "  3) Abbrechen"
+    info "Options:"
+    info "  1) Download official Radxa SPI image"
+    info "  2) Specify custom image (path)"
+    info "  3) Abort"
     echo ""
-    ask "Wahl [1/2/3]: "
+    ask "Choice [1/2/3]: "
     read -r choice
 
     case "$choice" in
         1)
-            info "Lade offizielles Radxa SPI-Image herunter..."
+            info "Downloading official Radxa SPI image..."
             SPI_URL="$RADXA_SPI_IMAGE_URL"
             DOWNLOAD_DIR="$SPI_DOWNLOAD_DIR"
             mkdir -p "$DOWNLOAD_DIR"
 
             if command -v wget &>/dev/null; then
                 wget -O "$DOWNLOAD_DIR/rock-5b-spi-image.img" "$SPI_URL" || {
-                    err "Download fehlgeschlagen!"
-                    info "Bitte lade das Image manuell herunter:"
+                    err "Download failed!"
+                    info "Please download the image manually:"
                     info "  $SPI_URL"
-                    info "Und starte das Script erneut mit Option 2."
+                    info "Then run the script again with option 2."
                     exit 1
                 }
             elif command -v curl &>/dev/null; then
                 curl -L -o "$DOWNLOAD_DIR/rock-5b-spi-image.img" "$SPI_URL" || {
-                    err "Download fehlgeschlagen!"
+                    err "Download failed!"
                     exit 1
                 }
             else
-                err "Weder wget noch curl verfügbar!"
+                err "Neither wget nor curl is available!"
                 exit 1
             fi
             UBOOT_SPI_IMG="$DOWNLOAD_DIR/rock-5b-spi-image.img"
-            ok "Download erfolgreich: $UBOOT_SPI_IMG"
+            ok "Download successful: $UBOOT_SPI_IMG"
             ;;
         2)
-            ask "Pfad zum SPI-Image: "
+            ask "Path to SPI image: "
             read -r custom_path
             if [[ -f "$custom_path" ]]; then
                 UBOOT_SPI_IMG="$custom_path"
                 ok "Image: $UBOOT_SPI_IMG"
             else
-                err "Datei nicht gefunden: $custom_path"
+                err "File not found: $custom_path"
                 exit 1
             fi
             ;;
         *)
-            echo "Abgebrochen."
+            echo "Aborted."
             exit 0
             ;;
     esac
 fi
 
 echo ""
-info "Zu flashendes Image:"
+info "Image to flash:"
 ls -lh "$UBOOT_SPI_IMG"
 
 pause
 
 # ============================================================
-# Schritt 4: SPI-Flash beschreiben
+# Step 4: Write SPI flash
 # ============================================================
-header "Schritt 4: SPI-Flash beschreiben"
+header "Step 4: Write SPI flash"
 
 if [[ "$SPI_EMPTY" == false ]]; then
-    warn "Der SPI-Flash enthält bereits Daten!"
-    info "Der vorhandene Bootloader wird überschrieben."
+    warn "The SPI flash already contains data!"
+    info "The existing bootloader will be overwritten."
 fi
 
 echo ""
 echo -e "${RED}${BOLD}  ╔══════════════════════════════════════════════╗${NC}"
-echo -e "${RED}${BOLD}  ║  ACHTUNG: Flash-Vorgang!                    ║${NC}"
+echo -e "${RED}${BOLD}  ║  WARNING: Flash operation!                   ║${NC}"
 echo -e "${RED}${BOLD}  ║                                              ║${NC}"
-echo -e "${RED}${BOLD}  ║  - Unterbreche den Vorgang NICHT             ║${NC}"
-echo -e "${RED}${BOLD}  ║  - Stelle eine stabile Stromversorgung       ║${NC}"
-echo -e "${RED}${BOLD}  ║    sicher                                    ║${NC}"
-echo -e "${RED}${BOLD}  ║  - Ein fehlerhafter Flash kann dazu führen,  ║${NC}"
-echo -e "${RED}${BOLD}  ║    dass der Maskrom-Modus nötig wird         ║${NC}"
+echo -e "${RED}${BOLD}  ║  - Do NOT interrupt the process              ║${NC}"
+echo -e "${RED}${BOLD}  ║  - Ensure stable power supply                ║${NC}"
+echo -e "${RED}${BOLD}  ║                                              ║${NC}"
+echo -e "${RED}${BOLD}  ║  - A failed flash may require Maskrom        ║${NC}"
+echo -e "${RED}${BOLD}  ║    mode to recover                           ║${NC}"
 echo -e "${RED}${BOLD}  ╚══════════════════════════════════════════════╝${NC}"
 echo ""
 
-if ! confirm "SPI-Flash JETZT beschreiben?"; then
-    echo "Abgebrochen."
+if ! confirm "Write SPI flash NOW?"; then
+    echo "Aborted."
     exit 0
 fi
 
-# Prüfe ob armbian-install verfügbar ist (bevorzugt)
+# Check whether armbian-install is available (preferred)
 if command -v armbian-install &>/dev/null && [[ -n "$UBOOT_SPI_IMG" ]]; then
-    info "armbian-install ist verfügbar."
-    info "Nutze trotzdem direkten Flash-Weg für mehr Kontrolle."
+    info "armbian-install is available."
+    info "Using direct flash method anyway for more control."
 fi
 
-# Direkter Flash-Weg über MTD
+# Direct flash via MTD
 if [[ -c "$SPI_MTD" ]]; then
-    info "Flashe über MTD-Device $SPI_MTD ..."
+    info "Flashing via MTD device $SPI_MTD ..."
 
-    # Sicherung des aktuellen SPI-Inhalts
-    info "Erstelle Backup des aktuellen SPI-Flash-Inhalts..."
+    # Back up current SPI contents
+    info "Creating backup of current SPI flash contents..."
     BACKUP_FILE=$(mktemp /tmp/spi-flash-backup-XXXXXXXX.bin)
     if dd if="${SPI_MTD}ro" of="$BACKUP_FILE" bs=$SPI_DD_BLOCK_SIZE 2>/dev/null; then
-        ok "Backup gespeichert: $BACKUP_FILE"
+        ok "Backup saved: $BACKUP_FILE"
     else
-        warn "Backup konnte nicht erstellt werden (nicht kritisch)."
+        warn "Backup could not be created (non-critical)."
     fi
 
-    # Flash-Vorgang
+    # Flash operation
     if command -v flashcp &>/dev/null; then
-        info "Nutze flashcp..."
+        info "Using flashcp..."
         flashcp -v "$UBOOT_SPI_IMG" "$SPI_MTD"
     elif command -v mtd_debug &>/dev/null; then
-        info "Nutze mtd_debug..."
+        info "Using mtd_debug..."
         MTD_SIZE=$(wc -c < "$UBOOT_SPI_IMG")
         mtd_debug erase "$SPI_MTD" 0 "$MTD_SIZE" || {
-            err "mtd_debug erase fehlgeschlagen! Flash-Vorgang abgebrochen."
-            err "Backup liegt unter: $BACKUP_FILE"
+            err "mtd_debug erase failed! Flash operation aborted."
+            err "Backup is located at: $BACKUP_FILE"
             exit 1
         }
         mtd_debug write "$SPI_MTD" 0 "$MTD_SIZE" "$UBOOT_SPI_IMG" || {
-            err "mtd_debug write fehlgeschlagen! SPI könnte korrumpiert sein."
-            err "Backup liegt unter: $BACKUP_FILE"
+            err "mtd_debug write failed! SPI may be corrupted."
+            err "Backup is located at: $BACKUP_FILE"
             exit 1
         }
     else
-        info "Nutze dd (Fallback)..."
-        # Erst löschen (mit 0xFF füllen)
+        info "Using dd (fallback)..."
+        # Erase first (fill with 0xFF)
         flash_erase "$SPI_MTD" 0 0 2>/dev/null || {
-            warn "flash_erase nicht verfügbar, versuche direktes Schreiben..."
+            warn "flash_erase not available, trying direct write..."
         }
         dd if="$UBOOT_SPI_IMG" of="$SPI_MTD" bs=$SPI_DD_BLOCK_SIZE conv=fsync 2>/dev/null
     fi
 
-    # Verifikation
-    info "Verifiziere Flash-Inhalt..."
+    # Verification
+    info "Verifying flash contents..."
     VERIFY_FILE=$(mktemp /tmp/spi-verify-XXXXXXXX.bin)
     CLEANUP_FILES+=("$VERIFY_FILE")
     IMG_SIZE=$(wc -c < "$UBOOT_SPI_IMG")
@@ -442,196 +442,196 @@ if [[ -c "$SPI_MTD" ]]; then
     truncate -s "$IMG_SIZE" "$VERIFY_FILE"
 
     if cmp -s "$UBOOT_SPI_IMG" "$VERIFY_FILE"; then
-        ok "Verifikation erfolgreich! SPI-Flash wurde korrekt beschrieben."
+        ok "Verification successful! SPI flash was written correctly."
     else
-        err "Verifikation FEHLGESCHLAGEN!"
-        err "Die geschriebenen Daten stimmen nicht mit dem Image überein."
-        err "Backup liegt unter: $BACKUP_FILE"
-        warn "Bitte NICHT rebooten und das Problem zuerst untersuchen."
+        err "Verification FAILED!"
+        err "The written data does not match the image."
+        err "Backup is located at: $BACKUP_FILE"
+        warn "Please do NOT reboot and investigate the problem first."
         exit 1
     fi
 
 elif [[ -b "$SPI_MTD" ]]; then
-    info "Flashe über Block-Device $SPI_MTD ..."
+    info "Flashing via block device $SPI_MTD ..."
     dd if="$UBOOT_SPI_IMG" of="$SPI_MTD" bs=$SPI_DD_BLOCK_SIZE conv=fsync
     sync
-    ok "Flash-Vorgang abgeschlossen (keine Verifikation über Block-Device)."
+    ok "Flash operation completed (no verification via block device)."
 else
-    err "Kein geeignetes MTD-Device gefunden!"
+    err "No suitable MTD device found!"
     exit 1
 fi
 
-ok "SPI-Flash erfolgreich beschrieben!"
+ok "SPI flash written successfully!"
 echo ""
 
 pause
 
 # ============================================================
-# Schritt 5: Boot-Reihenfolge konfigurieren
+# Step 5: Configure boot order
 # ============================================================
-header "Schritt 5: Boot-Reihenfolge konfigurieren"
+header "Step 5: Configure boot order"
 
-info "Ziel: USB soll VOR SD-Karte und eMMC geprüft werden."
+info "Goal: USB should be checked BEFORE SD card and eMMC."
 echo ""
 
-# Prüfe ob fw_printenv / fw_setenv verfügbar
+# Check whether fw_printenv / fw_setenv is available
 FW_ENV_AVAILABLE=false
 if command -v fw_printenv &>/dev/null; then
     FW_ENV_AVAILABLE=true
-    ok "fw_printenv / fw_setenv ist verfügbar."
+    ok "fw_printenv / fw_setenv is available."
 else
-    warn "fw_printenv nicht gefunden. Installiere libubootenv-tool..."
+    warn "fw_printenv not found. Installing libubootenv-tool..."
     if command -v apt-get &>/dev/null; then
         apt-get update -qq 2>/dev/null
         if apt-get install -y -qq libubootenv-tool 2>/dev/null; then
             FW_ENV_AVAILABLE=true
-            ok "libubootenv-tool installiert."
+            ok "libubootenv-tool installed."
         else
-            warn "Installation fehlgeschlagen. Versuche u-boot-tools..."
+            warn "Installation failed. Trying u-boot-tools..."
             if apt-get install -y -qq u-boot-tools 2>/dev/null; then
                 FW_ENV_AVAILABLE=true
-                ok "u-boot-tools installiert."
+                ok "u-boot-tools installed."
             fi
         fi
     fi
 fi
 
-# fw_env.config prüfen/erstellen
+# Check/create fw_env.config
 if [[ "$FW_ENV_AVAILABLE" == true ]]; then
     if [[ ! -f /etc/fw_env.config ]]; then
-        warn "/etc/fw_env.config existiert nicht. Erstelle Standard-Konfiguration..."
-        info "Für Rock 5B mit SPI-Flash U-Boot Environment (Armbian):"
-        # Armbian-spezifische Werte aus config/boards/rock-5b.conf:
+        warn "/etc/fw_env.config does not exist. Creating default configuration..."
+        info "For Rock 5B with SPI flash U-Boot environment (Armbian):"
+        # Armbian-specific values from config/boards/rock-5b.conf:
         #   CONFIG_ENV_IS_IN_SPI_FLASH=y
-        #   CONFIG_ENV_OFFSET=0xc00000  (12 MB ins 16 MB SPI)
+        #   CONFIG_ENV_OFFSET=0xc00000  (12 MB into 16 MB SPI)
         #   CONFIG_ENV_SIZE=0x20000     (128 KB)
-        #   CONFIG_ENV_SECT_SIZE_AUTO=y (4 KB Erase-Block, Macronix MX25U12835F)
-        # ACHTUNG: Upstream U-Boot und Radxa-offizielle Builds nutzen ggf.
-        # andere Offsets (z.B. CONFIG_ENV_IS_IN_MMC statt SPI)!
+        #   CONFIG_ENV_SECT_SIZE_AUTO=y (4 KB erase block, Macronix MX25U12835F)
+        # NOTE: Upstream U-Boot and official Radxa builds may use different
+        # offsets (e.g. CONFIG_ENV_IS_IN_MMC instead of SPI)!
         cat > /etc/fw_env.config << EOF
 # Device name    Device offset    Env. size    Flash sector size
-# Armbian Rock 5B: ENV im SPI NOR @ 12MB, 128KB, 4KB Sektoren
+# Armbian Rock 5B: ENV in SPI NOR @ 12 MB, 128 KB, 4 KB sectors
 /dev/mtd0        $UBOOT_ENV_OFFSET         $UBOOT_ENV_SIZE      $UBOOT_ENV_SECTOR_SIZE
 EOF
-        ok "/etc/fw_env.config erstellt."
+        ok "/etc/fw_env.config created."
     fi
 
     echo ""
-    info "Versuche aktuelle U-Boot Umgebungsvariablen zu lesen..."
+    info "Trying to read current U-Boot environment variables..."
     echo ""
 
     CURRENT_BOOT_TARGETS=""
     if fw_printenv boot_targets 2>/dev/null; then
         CURRENT_BOOT_TARGETS=$(fw_printenv boot_targets 2>/dev/null | cut -d= -f2)
         echo ""
-        ok "Aktuelle boot_targets: $CURRENT_BOOT_TARGETS"
+        ok "Current boot_targets: $CURRENT_BOOT_TARGETS"
     else
-        warn "Konnte boot_targets nicht lesen."
-        info "Das kann bedeuten:"
-        info "  - Die Environment-Offsets stimmen nicht"
-        info "  - Der U-Boot nutzt Compile-Time Defaults (kein gespeichertes Env)"
-        info "  - Der SPI-Flash wurde gerade erst beschrieben und hat noch kein Env"
+        warn "Could not read boot_targets."
+        info "This may mean:"
+        info "  - The environment offsets are incorrect"
+        info "  - U-Boot is using compile-time defaults (no saved environment)"
+        info "  - The SPI flash was just written and has no environment yet"
         echo ""
-        info "Standardmäßige Boot-Reihenfolge bei Armbian Rock 5B:"
+        info "Default boot order for Armbian Rock 5B:"
         info "  mmc1 nvme mmc0 scsi usb pxe dhcp spi"
         CURRENT_BOOT_TARGETS="$DEFAULT_BOOT_ORDER"
     fi
 
     echo ""
-    info "Gewünschte neue Reihenfolge (USB zuerst):"
+    info "Desired new order (USB first):"
     NEW_BOOT_TARGETS="$USB_FIRST_BOOT_ORDER"
     echo -e "  ${GREEN}$NEW_BOOT_TARGETS${NC}"
     echo ""
-    info "Erklärung:"
-    info "  usb   = USB-Massenspeicher (dein USB-Stick)"
-    info "  mmc1  = SD-Karte"
+    info "Explanation:"
+    info "  usb   = USB mass storage (your USB drive)"
+    info "  mmc1  = SD card"
     info "  nvme  = NVMe SSD"
     info "  mmc0  = eMMC"
     info "  scsi  = SATA/SCSI"
-    info "  pxe   = Netzwerk-Boot (PXE)"
-    info "  dhcp  = Netzwerk-Boot (DHCP)"
-    info "  spi   = SPI NOR Flash"
+    info "  pxe   = Network boot (PXE)"
+    info "  dhcp  = Network boot (DHCP)"
+    info "  spi   = SPI NOR flash"
     echo ""
 
-    ask "Eigene Reihenfolge eingeben oder Enter für Standard: "
+    ask "Enter custom order or press Enter for default: "
     read -r custom_order
     if [[ -n "$custom_order" ]]; then
         NEW_BOOT_TARGETS="$custom_order"
-        info "Verwende: $NEW_BOOT_TARGETS"
+        info "Using: $NEW_BOOT_TARGETS"
     fi
 
     echo ""
-    if confirm "Boot-Reihenfolge auf '$NEW_BOOT_TARGETS' setzen?"; then
+    if confirm "Set boot order to '$NEW_BOOT_TARGETS'?"; then
         if fw_setenv boot_targets "$NEW_BOOT_TARGETS" 2>/dev/null; then
-            ok "boot_targets erfolgreich gesetzt!"
+            ok "boot_targets set successfully!"
 
-            # Verifizierung
+            # Verification
             VERIFY_TARGETS=$(fw_printenv boot_targets 2>/dev/null | cut -d= -f2 || true)
             if [[ "$VERIFY_TARGETS" == "$NEW_BOOT_TARGETS" ]]; then
-                ok "Verifiziert: $VERIFY_TARGETS"
+                ok "Verified: $VERIFY_TARGETS"
             else
-                warn "Verifikation unklar. Bitte nach Reboot prüfen."
+                warn "Verification unclear. Please check after reboot."
             fi
         else
-            err "fw_setenv fehlgeschlagen!"
+            err "fw_setenv failed!"
             echo ""
-            info "Alternative: Boot-Reihenfolge über /boot/armbianEnv.txt konfigurieren."
+            info "Alternative: Configure boot order via /boot/armbianEnv.txt."
         fi
     fi
 else
-    warn "fw_printenv/fw_setenv nicht verfügbar."
+    warn "fw_printenv/fw_setenv not available."
 fi
 
 # ============================================================
-# Alternative/Ergänzung: armbianEnv.txt
+# Alternative/supplement: armbianEnv.txt
 # ============================================================
 echo ""
-info "Prüfe /boot/armbianEnv.txt als ergänzende Konfiguration..."
+info "Checking /boot/armbianEnv.txt as supplementary configuration..."
 
 if [[ -f /boot/armbianEnv.txt ]]; then
     echo ""
-    info "Aktuelle /boot/armbianEnv.txt:"
+    info "Current /boot/armbianEnv.txt:"
     echo "  ─────────────────────────────"
     sed 's/^/  │ /' /boot/armbianEnv.txt
     echo "  ─────────────────────────────"
     echo ""
 
-    # Prüfe ob rootdev angepasst werden soll
-    info "Falls du das Root-Dateisystem auf dem USB-Stick hast,"
-    info "muss 'rootdev' in /boot/armbianEnv.txt angepasst werden."
+    # Check whether rootdev needs to be adjusted
+    info "If your root filesystem is on the USB drive,"
+    info "'rootdev' in /boot/armbianEnv.txt must be updated."
     echo ""
 
-    # USB-Geräte anzeigen
-    info "Erkannte Block-Devices:"
+    # Show USB devices
+    info "Detected block devices:"
     echo ""
     lsblk -o NAME,SIZE,TYPE,MOUNTPOINT,LABEL,FSTYPE 2>/dev/null | head -$LSBLK_DISPLAY_LIMIT
     echo ""
 
-    if confirm "Möchtest du rootdev in armbianEnv.txt auf ein USB-Device setzen?"; then
-        # USB-Geräte filtern
-        info "Verfügbare USB-Speicher:"
+    if confirm "Set rootdev in armbianEnv.txt to a USB device?"; then
+        # Filter USB devices
+        info "Available USB storage:"
         USB_DEVS=$(lsblk -dpno NAME,SIZE,TRAN 2>/dev/null | grep "usb" || true)
         if [[ -z "$USB_DEVS" ]]; then
-            warn "Kein USB-Speichergerät erkannt."
-            info "Stecke den USB-Stick ein und starte diesen Schritt erneut."
+            warn "No USB storage device detected."
+            info "Plug in the USB drive and restart this step."
         else
             echo "$USB_DEVS"
             echo ""
-            ask "Device für rootdev (z.B. /dev/sda1): "
+            ask "Device for rootdev (e.g. /dev/sda1): "
             read -r usb_rootdev
             if [[ -b "$usb_rootdev" ]]; then
                 # Backup
                 cp /boot/armbianEnv.txt /boot/armbianEnv.txt.bak
-                ok "Backup erstellt: /boot/armbianEnv.txt.bak"
+                ok "Backup created: /boot/armbianEnv.txt.bak"
 
                 if grep -q "^rootdev=" /boot/armbianEnv.txt; then
                     sed -i "s|^rootdev=.*|rootdev=$usb_rootdev|" /boot/armbianEnv.txt
                 else
                     echo "rootdev=$usb_rootdev" >> /boot/armbianEnv.txt
                 fi
-                ok "rootdev gesetzt auf: $usb_rootdev"
+                ok "rootdev set to: $usb_rootdev"
             else
-                warn "Device '$usb_rootdev' existiert nicht. Überspringe."
+                warn "Device '$usb_rootdev' does not exist. Skipping."
             fi
         fi
     fi
@@ -640,56 +640,56 @@ fi
 pause
 
 # ============================================================
-# Zusammenfassung
+# Summary
 # ============================================================
-header "Zusammenfassung"
+header "Summary"
 
-echo -e "${GREEN}Durchgeführte Aktionen:${NC}"
+echo -e "${GREEN}Actions performed:${NC}"
 echo ""
 
 if [[ -n "$UBOOT_SPI_IMG" ]]; then
-    echo -e "  ✓ U-Boot auf SPI-Flash geschrieben"
+    echo -e "  ✓ U-Boot written to SPI flash"
     echo -e "    Image: $UBOOT_SPI_IMG"
 fi
 
 if [[ "$FW_ENV_AVAILABLE" == true ]]; then
-    echo -e "  ✓ Boot-Reihenfolge konfiguriert"
-    FINAL_TARGETS=$(fw_printenv boot_targets 2>/dev/null | cut -d= -f2 || echo "(konnte nicht gelesen werden)")
+    echo -e "  ✓ Boot order configured"
+    FINAL_TARGETS=$(fw_printenv boot_targets 2>/dev/null | cut -d= -f2 || echo "(could not be read)")
     echo -e "    boot_targets: $FINAL_TARGETS"
 fi
 
 if [[ -f /boot/armbianEnv.txt.bak ]]; then
-    echo -e "  ✓ armbianEnv.txt angepasst (Backup: armbianEnv.txt.bak)"
+    echo -e "  ✓ armbianEnv.txt updated (backup: armbianEnv.txt.bak)"
 fi
 
 echo ""
-echo -e "${YELLOW}Nächste Schritte:${NC}"
+echo -e "${YELLOW}Next steps:${NC}"
 echo ""
-echo "  1. Stelle sicher, dass dein USB-Stick ein bootfähiges System enthält"
-echo "     (z.B. mit Armbian geflasht via dd oder Etcher)"
+echo "  1. Make sure your USB drive contains a bootable system"
+echo "     (e.g. flashed with Armbian via dd or Etcher)"
 echo ""
-echo "  2. Stecke den USB-Stick ein"
+echo "  2. Plug in the USB drive"
 echo ""
 echo "  3. Reboot:"
 echo "     → sudo reboot"
 echo ""
-echo "  4. Das System sollte nun vom USB-Stick booten"
-echo "     (sofern ein gültiges System darauf ist)"
+echo "  4. The system should now boot from the USB drive"
+echo "     (provided a valid system is present on it)"
 echo ""
 echo -e "${YELLOW}Troubleshooting:${NC}"
 echo ""
-echo "  - Falls das System nicht vom USB bootet:"
-echo "    → Prüfe ob der USB-Stick korrekt formatiert/geflasht ist"
-echo "    → Versuche einen USB 2.0 Port (bessere U-Boot-Unterstützung)"
-echo "    → SD-Karte entfernen und nur USB-Stick nutzen"
+echo "  - If the system does not boot from USB:"
+echo "    → Check whether the USB drive is correctly formatted/flashed"
+echo "    → Try a USB 2.0 port (better U-Boot support)"
+echo "    → Remove the SD card and use only the USB drive"
 echo ""
-echo "  - Falls das System gar nicht mehr bootet:"
-echo "    → SD-Karte mit funktionierendem Armbian einlegen"
-echo "    → Im Notfall: Maskrom-Modus (goldener Button) + rkdeveloptool"
-echo "    → SPI-Flash Backup: ${BACKUP_FILE:-nicht erstellt}"
+echo "  - If the system no longer boots at all:"
+echo "    → Insert an SD card with a working Armbian"
+echo "    → In an emergency: Maskrom mode (golden button) + rkdeveloptool"
+echo "    → SPI flash backup: ${BACKUP_FILE:-not created}"
 echo ""
-echo "  - Boot-Reihenfolge zurücksetzen:"
+echo "  - Reset boot order:"
 echo "    → sudo fw_setenv boot_targets \"mmc1 nvme mmc0 scsi usb pxe dhcp spi\""
 echo ""
 
-ok "Script abgeschlossen. Viel Erfolg!"
+ok "Script completed. Good luck!"

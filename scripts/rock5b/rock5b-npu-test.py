@@ -32,17 +32,17 @@ Manual preparation on the board:
     #    The Ubuntu Noble apt package "mesa-teflon-delegate" only contains
     #    Etnaviv support (VeriSilicon VIPNano), NOT Rocket/RK3588.
     #
-    #    Option A — Pre-built von GitHub Release (gh CLI):
+    #    Option A — Pre-built from GitHub Release (gh CLI):
     #    gh release download teflon-v25.3.5 --repo vroomfondel/sbcstuff -p 'libteflon.so' -D /usr/local/lib/teflon/
     #    chmod 755 /usr/local/lib/teflon/libteflon.so
     #
-    #    Option A — Pre-built von GitHub Release (curl):
+    #    Option A — Pre-built from GitHub Release (curl):
     #    mkdir -p /usr/local/lib/teflon
     #    curl -fLo /usr/local/lib/teflon/libteflon.so \
     #      https://github.com/vroomfondel/sbcstuff/releases/download/teflon-v25.3.5/libteflon.so
     #    chmod 755 /usr/local/lib/teflon/libteflon.so
     #
-    #    Option B — Build-Script (baut Mesa 25.3.5 aus Source):
+    #    Option B — Build script (builds Mesa 25.3.5 from source):
     #    sudo ./build-mesa-teflon.sh
 """
 
@@ -101,7 +101,7 @@ APT_DEPENDENCIES = ["python3-pip", "libdrm2"]
 
 
 def _ensure_apt_packages() -> None:
-    """Stelle sicher, dass benötigte apt-Pakete installiert sind."""
+    """Ensure required apt packages are installed."""
     import subprocess as _sp
     import sys
 
@@ -117,17 +117,17 @@ def _ensure_apt_packages() -> None:
     if not missing:
         return
 
-    print(f"  \033[0;36mℹ\033[0m Installiere fehlende Pakete: {', '.join(missing)} ...")
+    print(f"  \033[0;36mℹ\033[0m Installing missing packages: {', '.join(missing)} ...")
     try:
         _sp.check_call(["apt-get", "install", "-y"] + missing)
     except (FileNotFoundError, _sp.CalledProcessError):
-        print(f"  \033[0;31m✘\033[0m apt-Installation fehlgeschlagen: {', '.join(missing)}")
-        print(f"  \033[0;36mℹ\033[0m Manuell: sudo apt install {' '.join(missing)}")
+        print(f"  \033[0;31m✘\033[0m apt installation failed: {', '.join(missing)}")
+        print(f"  \033[0;36mℹ\033[0m Manual: sudo apt install {' '.join(missing)}")
         sys.exit(1)
 
 
 def _ensure_pip() -> None:
-    """Stelle sicher, dass pip verfügbar ist — ggf. per apt nachinstallieren."""
+    """Ensure pip is available — install via apt if necessary."""
     import subprocess as _sp
     import sys
 
@@ -140,13 +140,13 @@ def _ensure_pip() -> None:
 
     _ensure_apt_packages()
 
-    # Nochmal prüfen nach apt install
+    # Re-check after apt install
     result = _sp.run(
         [sys.executable, "-m", "pip", "--version"],
         capture_output=True,
     )
     if result.returncode != 0:
-        print("  \033[0;31m✘\033[0m pip nach Installation immer noch nicht verfügbar")
+        print("  \033[0;31m✘\033[0m pip still not available after installation")
         sys.exit(1)
 
 
@@ -161,15 +161,15 @@ def install_and_import(packagename: str, pipname: str) -> None:
     except ImportError:
         pass
 
-    print(f"  \033[0;36mℹ\033[0m {packagename} nicht gefunden — installiere {pipname} via pip ...")
+    print(f"  \033[0;36mℹ\033[0m {packagename} not found — installing {pipname} via pip ...")
     _ensure_pip()
     try:
         _sp.check_call(
             [sys.executable, "-m", "pip", "install", "--break-system-packages", pipname],
         )
     except _sp.CalledProcessError:
-        print(f"  \033[0;31m✘\033[0m Installation von {pipname} fehlgeschlagen")
-        print(f"  \033[0;36mℹ\033[0m Manuell versuchen: pip install --break-system-packages {pipname}")
+        print(f"  \033[0;31m✘\033[0m Installation of {pipname} failed")
+        print(f"  \033[0;36mℹ\033[0m Try manually: pip install --break-system-packages {pipname}")
         sys.exit(1)
 
     globals()[packagename] = importlib.import_module(packagename)
@@ -220,29 +220,29 @@ def header(msg: str) -> None:
 
 # -- Configuration -------------------------------------------------------------
 # Model presets (quantized .tflite from google-coral/test_data)
-# Hinweis: Nicht alle Tensoren sind INT8 — einige Ops (z.B. Detection PostProcess,
-# DEQUANTIZE, LOGISTIC) bleiben float32. Prüfung: --check-int8
+# Note: Not all tensors are INT8 — some ops (e.g. Detection PostProcess,
+# DEQUANTIZE, LOGISTIC) remain float32. Check with: --check-int8
 CORAL_BASE_URL = "https://raw.githubusercontent.com/google-coral/test_data/master"
 MODEL_PRESETS = {
     "small": {
         "file": "mobilenet_v2_1.0_224_quant.tflite",
-        "desc": "MobileNet v2 (~3.4 MB, schnell, wenig Rechenaufwand)",
+        "desc": "MobileNet v2 (~3.4 MB, fast, low compute)",
     },
     "medium": {
         "file": "mobilenet_v1_1.0_224_quant.tflite",
-        "desc": "MobileNet v1 (~4.3 MB, mittlerer Rechenaufwand)",
+        "desc": "MobileNet v1 (~4.3 MB, medium compute)",
     },
     "large": {
         "file": "ssd_mobilenet_v2_coco_quant_postprocess.tflite",
-        "desc": "SSD MobileNet v2 Object Detection (~6.5 MB, hoher Rechenaufwand)",
+        "desc": "SSD MobileNet v2 Object Detection (~6.5 MB, high compute)",
     },
     "xlarge": {
         "file": "inception_v1_224_quant.tflite",
-        "desc": "Inception v1 (~6.4 MB, hoher Rechenaufwand)",
+        "desc": "Inception v1 (~6.4 MB, high compute)",
     },
     "xxlarge": {
         "file": "inception_v2_224_quant.tflite",
-        "desc": "Inception v2 (~11 MB, sehr hoher Rechenaufwand)",
+        "desc": "Inception v2 (~11 MB, very high compute)",
     },
 }
 DEFAULT_MODEL_PRESET = "large"
@@ -261,14 +261,14 @@ TEFLON_SEARCH_PATHS = [
 
 # Benchmark parameters
 CPU_WARMUP_RUNS = 5  # CPU warmup iterations
-NPU_WARMUP_RUNS = 20  # NPU warmup iterations (Rocket braucht mehr)
+NPU_WARMUP_RUNS = 20  # NPU warmup iterations (Rocket needs more)
 BENCHMARK_NUM_RUNS = 50  # Fallback if model size unknown
 CPU_NUM_THREADS = 4  # Threads for CPU interpreter (XNNPACK)
 
 # Dynamic run count based on model file size
-#   < 5 MB  → 100 runs  (kleine Models, schnelle Inference)
-#   5-20 MB → 50 runs   (mittlere Models)
-#   > 20 MB → 20 runs   (große Models, langsame Inference)
+#   < 5 MB  → 100 runs  (small models, fast inference)
+#   5-20 MB → 50 runs   (medium models)
+#   > 20 MB → 20 runs   (large models, slow inference)
 MODEL_SIZE_THRESHOLDS = [
     (5 * 1024 * 1024, 100),
     (20 * 1024 * 1024, 50),
@@ -292,7 +292,7 @@ OUTPUT_COMPARISON_TOLERANCE = 2  # Absolute tolerance for output comparison
 
 
 def num_runs_for_model(model_path: Path) -> int:
-    """Bestimme Anzahl Benchmark-Runs anhand der Modelgröße."""
+    """Determine number of benchmark runs based on model size."""
     try:
         size = model_path.stat().st_size
     except OSError:
@@ -316,14 +316,14 @@ def download_model(preset: str) -> Path:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     url = f"{CORAL_BASE_URL}/{filename}"
 
-    info(f"Lade {model_info['desc']} ...")
+    info(f"Downloading {model_info['desc']} ...")
     urllib.request.urlretrieve(url, model_path)
 
     if not model_path.exists():
-        fail("Download fehlgeschlagen")
+        fail("Download failed")
         sys.exit(1)
 
-    ok(f"Model gespeichert: {model_path} ({model_path.stat().st_size // 1024} KB)")
+    ok(f"Model saved: {model_path} ({model_path.stat().st_size // 1024} KB)")
     return model_path
 
 
@@ -512,14 +512,14 @@ def run_system_checks() -> SystemInfo:
     else:
         fail("Teflon delegate (libteflon.so) not found")
         info("Mesa Teflon must be installed for NPU acceleration")
-        info("Option 1 — Build-Script (empfohlen):")
+        info("Option 1 — Build script (recommended):")
         info("  sudo ./build-mesa-teflon.sh")
-        info("Option 2 — Pre-built von GitHub Release:")
+        info("Option 2 — Pre-built from GitHub Release:")
         info(
             "  gh release download teflon-v25.3.5 --repo vroomfondel/sbcstuff -p 'libteflon.so' -D /usr/local/lib/teflon/"
         )
         info("  chmod 755 /usr/local/lib/teflon/libteflon.so")
-        info("Option 3 — Pre-built von GitHub Release (curl):")
+        info("Option 3 — Pre-built from GitHub Release (curl):")
         info("  mkdir -p /usr/local/lib/teflon")
         info("  curl -fLo /usr/local/lib/teflon/libteflon.so \\")
         info("    https://github.com/vroomfondel/sbcstuff/releases/download/teflon-v25.3.5/libteflon.so")
@@ -561,7 +561,7 @@ def load_tflite_runtime() -> tuple[type[_TFInterpreter], Callable[[str], object]
 
 
 def check_model_int8(model_path: Path) -> bool:
-    """Prüfe ob ein TFLite-Model vollständig INT8-quantisiert ist."""
+    """Check whether a TFLite model is fully INT8-quantized."""
     import numpy as np
 
     Interpreter, _ = load_tflite_runtime()
@@ -581,40 +581,40 @@ def check_model_int8(model_path: Path) -> bool:
     float_ops = [t for t in tensor_details if t["dtype"] == np.float32]
 
     if not float_ops:
-        ok("Model ist vollständig INT8-quantisiert")
+        ok("Model is fully INT8-quantized")
         return True
 
-    warn(f"{len(float_ops)} von {len(tensor_details)} Tensoren sind float32 (nicht INT8)")
-    info("Rocket/Teflon NPU benötigt vollständig INT8-quantisierte Models")
+    warn(f"{len(float_ops)} of {len(tensor_details)} tensors are float32 (not INT8)")
+    info("Rocket/Teflon NPU requires fully INT8-quantized models")
     return False
 
 
 def convert_model_int8(source: Path, output: Path, *, num_calibration: int = 100) -> Path:
-    """Konvertiere ein Float-Model (SavedModel oder .tflite) zu vollständig INT8-quantisiert.
+    """Convert a float model (SavedModel or .tflite) to fully INT8-quantized.
 
-    Verwendet representative_dataset mit Zufallsdaten zur Kalibrierung.
-    Erzwingt INT8 für Input/Output (Voraussetzung für Rocket NPU).
+    Uses representative_dataset with random data for calibration.
+    Forces INT8 for input/output (required for Rocket NPU).
     """
     import tensorflow as tf
 
-    info(f"Lade Quell-Model: {source}")
+    info(f"Loading source model: {source}")
 
     if source.is_dir():
         # TensorFlow SavedModel directory
         converter = tf.lite.TFLiteConverter.from_saved_model(str(source))
     elif source.suffix == ".tflite":
-        # .tflite enthält nur den optimierten Graphen, nicht den Original-Graphen —
-        # TFLiteConverter kann daraus nicht re-quantisieren.
-        fail("Bereits konvertierte .tflite-Dateien können nicht re-quantisiert werden")
-        info("TFLiteConverter benötigt den Original-Graphen (SavedModel, .h5 oder .keras)")
-        info(f"Quantisierung prüfen: --check-int8 --model {source}")
+        # .tflite only contains the optimized graph, not the original graph —
+        # TFLiteConverter cannot re-quantize from it.
+        fail("Already converted .tflite files cannot be re-quantized")
+        info("TFLiteConverter requires the original graph (SavedModel, .h5 or .keras)")
+        info(f"Check quantization: --check-int8 --model {source}")
         sys.exit(1)
     elif source.suffix in (".h5", ".keras"):
         model = tf.keras.models.load_model(str(source))
         converter = tf.lite.TFLiteConverter.from_keras_model(model)
     else:
-        fail(f"Unbekanntes Format: {source.suffix}")
-        info("Unterstützt: SavedModel-Verzeichnis, .h5, .keras")
+        fail(f"Unknown format: {source.suffix}")
+        info("Supported: SavedModel directory, .h5, .keras")
         sys.exit(1)
 
     # Determine input shape from converter
@@ -629,18 +629,18 @@ def convert_model_int8(source: Path, output: Path, *, num_calibration: int = 100
     except Exception:
         # Fallback: common image input shape
         input_shape = (1, 224, 224, 3)
-        warn(f"Input-Shape nicht ermittelbar — verwende Fallback {input_shape}")
+        warn(f"Cannot determine input shape — using fallback {input_shape}")
 
     import numpy as np
 
-    info(f"Kalibrierung mit {num_calibration} Zufalls-Samples (Shape: {input_shape}) ...")
-    warn("Zufallsdaten dienen nur als Fallback-Kalibrierung")
-    info("Für präzisere Quantisierung echte Eingabedaten verwenden (z.B. Bilder)")
+    info(f"Calibrating with {num_calibration} random samples (shape: {input_shape}) ...")
+    warn("Random data serves only as fallback calibration")
+    info("For more precise quantization use real input data (e.g. images)")
 
-    # Kalibrierungsdaten: Der Converter misst die Wertebereiche (min/max) jedes Tensors,
-    # um daraus INT8-Quantisierungsparameter (Scale + Zero-Point) zu berechnen.
-    # Zufallsdaten liefern brauchbare, aber nicht optimale Ergebnisse —
-    # mit echten, repräsentativen Daten wäre die Quantisierung genauer.
+    # Calibration data: The converter measures value ranges (min/max) of each tensor
+    # to compute INT8 quantization parameters (scale + zero-point).
+    # Random data yields usable but not optimal results —
+    # real, representative data would produce more accurate quantization.
     def representative_data_gen() -> object:
         for _ in range(num_calibration):
             data = np.random.rand(*input_shape).astype(np.float32)
@@ -652,20 +652,20 @@ def convert_model_int8(source: Path, output: Path, *, num_calibration: int = 100
     converter.inference_input_type = tf.int8
     converter.inference_output_type = tf.int8
 
-    info("Konvertiere zu INT8 ...")
+    info("Converting to INT8 ...")
     tflite_model = converter.convert()
 
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_bytes(tflite_model)
     size_mb = len(tflite_model) / (1024 * 1024)
-    ok(f"INT8-Model gespeichert: {output} ({size_mb:.1f} MB)")
+    ok(f"INT8 model saved: {output} ({size_mb:.1f} MB)")
 
     # Verify result
-    header("Verifizierung")
+    header("Verification")
     is_int8 = check_model_int8(output)
     if not is_int8:
-        warn("Konvertierung hat nicht alle Tensoren zu INT8 konvertiert")
-        info("Einige Ops haben möglicherweise keine INT8-Implementierung")
+        warn("Conversion did not convert all tensors to INT8")
+        info("Some ops may not have an INT8 implementation")
 
     return output
 
@@ -807,14 +807,14 @@ def _run_npu_benchmark_isolated(
 
         exitcode = proc.exitcode
         if exitcode is None or exitcode != 0:
-            fail(f"NPU Benchmark abgestürzt (Exit-Code {exitcode})")
+            fail(f"NPU benchmark crashed (exit code {exitcode})")
             if exitcode is not None and exitcode < 0:
                 import signal as _sig
 
                 sig = -exitcode
                 sig_name = _sig.Signals(sig).name if sig in _sig.Signals._value2member_map_ else str(sig)
-                info(f"Signal: {sig_name} — Rocket-Treiber unterstützt dieses Model wahrscheinlich nicht")
-            info("Tipp: --preset small oder ein anderes Model versuchen")
+                info(f"Signal: {sig_name} — Rocket driver probably does not support this model")
+            info("Tip: try --preset small or a different model")
             return None
 
         with open(result_file) as f:
@@ -824,29 +824,29 @@ def _run_npu_benchmark_isolated(
         return raw, partition_analysis
 
     except Exception as e:
-        fail(f"NPU Benchmark Fehler: {e}")
+        fail(f"NPU benchmark error: {e}")
         return None
     finally:
         Path(result_file).unlink(missing_ok=True)
 
 
 def _analyze_delegate_partitions(model_path: str, teflon_path: str) -> PartitionInfo | None:
-    """Differentielle Analyse der Delegate-Partitionierung.
+    """Differential analysis of delegate partitioning.
 
-    Strategie:
-    1. Interpreter mit Teflon erstellen, XNNPACK deaktivieren (experimental_op_resolver_type=3).
-       Dann sind ALLE DELEGATE-Nodes garantiert Teflon-Partitionen.
-       Fallback: mit XNNPACK, dann Signatur-Vergleich gegen CPU-only Interpreter.
-    2. Rückwärts-Tracing von DELEGATE-Outputs durch den regulären Op-Graphen.
-       Stoppt an Tensoren ohne Producer (Weights, Model-Input) und an Ops
-       die bereits einer früheren Partition zugeordnet sind.
+    Strategy:
+    1. Create interpreter with Teflon, disable XNNPACK (experimental_op_resolver_type=3).
+       Then ALL DELEGATE nodes are guaranteed to be Teflon partitions.
+       Fallback: with XNNPACK, then signature comparison against CPU-only interpreter.
+    2. Backward tracing from DELEGATE outputs through the regular op graph.
+       Stops at tensors without a producer (weights, model input) and at ops
+       already assigned to an earlier partition.
     """
     Interpreter, load_delegate = load_tflite_runtime()
 
     try:
         delegate = load_delegate(teflon_path)
 
-        # Versuche XNNPACK zu deaktivieren → nur Teflon-DELEGATEs bleiben
+        # Try to disable XNNPACK → only Teflon DELEGATEs remain
         xnnpack_disabled = False
         try:
             npu_interp = Interpreter(
@@ -869,10 +869,10 @@ def _analyze_delegate_partitions(model_path: str, teflon_path: str) -> Partition
     all_delegates = [op for op in npu_ops if op["op_name"] == "DELEGATE"]
 
     if xnnpack_disabled:
-        # Alle DELEGATE-Nodes sind Teflon
+        # All DELEGATE nodes are Teflon
         teflon_delegates = all_delegates
     else:
-        # Fallback: Signatur-Vergleich mit CPU-only Interpreter
+        # Fallback: signature comparison with CPU-only interpreter
         try:
             cpu_interp = Interpreter(model_path=model_path)
             cpu_interp.allocate_tensors()
@@ -912,15 +912,15 @@ def _analyze_delegate_partitions(model_path: str, teflon_path: str) -> Partition
     # Op-Index → Op Lookup
     op_by_index: dict[int, OpDetails] = {op["index"]: op for op in regular_ops}
 
-    # Rückwärts-Tracing von DELEGATE-Outputs durch den regulären Op-Graphen.
+    # Backward tracing from DELEGATE outputs through the regular op graph.
     #
-    # DELEGATE-Node "inputs" in _get_ops_details() enthält ALLE Tensoren des
-    # absorbierten Subgraphen (inkl. interner Intermediates), nicht nur die
-    # Boundary-Tensoren. Daher NICHT als Stop-Bedingung verwenden.
+    # DELEGATE node "inputs" in _get_ops_details() contains ALL tensors of the
+    # absorbed subgraph (including internal intermediates), not just the
+    # boundary tensors. Therefore do NOT use as stop condition.
     #
-    # Stattdessen: rückwärts tracen bis kein Producer mehr existiert (Weights,
-    # Model-Input). Delegates nach Output-Tensor sortieren (früheste zuerst),
-    # damit all_absorbed als natürliche Partitions-Grenze wirkt.
+    # Instead: trace backward until no producer exists (weights,
+    # model input). Sort delegates by output tensor (earliest first),
+    # so all_absorbed acts as a natural partition boundary.
     teflon_delegates.sort(key=lambda d: min(d["outputs"]))
 
     absorbed_per_partition: list[list[OpDetails]] = []
@@ -938,13 +938,13 @@ def _analyze_delegate_partitions(model_path: str, teflon_path: str) -> Partition
             visited.add(tensor)
 
             if tensor not in tensor_producer:
-                continue  # Weight, Bias oder Model-Input — kein Producer
+                continue  # Weight, bias or model input — no producer
             op_idx = tensor_producer[tensor]
             if op_idx in absorbed or op_idx in all_absorbed:
-                continue  # Bereits dieser oder einer früheren Partition zugeordnet
+                continue  # Already assigned to this or an earlier partition
             absorbed.add(op_idx)
 
-            # Weiter rückwärts durch ALLE Inputs dieser Op
+            # Continue backward through ALL inputs of this op
             producer_op = op_by_index.get(op_idx)
             if producer_op:
                 for inp_t in producer_op["inputs"]:
@@ -956,7 +956,7 @@ def _analyze_delegate_partitions(model_path: str, teflon_path: str) -> Partition
 
     cpu_fallback = [op for op in regular_ops if op["index"] not in all_absorbed]
 
-    # Ergebnis aufbereiten
+    # Prepare result
     partitions: list[PartitionDetail] = []
     for ops in absorbed_per_partition:
         partitions.append({"num_ops": len(ops), "op_types": _count_op_types(ops)})
@@ -972,7 +972,7 @@ def _analyze_delegate_partitions(model_path: str, teflon_path: str) -> Partition
 
 
 def _count_op_types(ops: list[OpDetails]) -> dict[str, int]:
-    """Zähle Op-Typen in einer Liste von Ops."""
+    """Count op types in a list of ops."""
     counts: dict[str, int] = {}
     for op in ops:
         name = str(op["op_name"])
@@ -981,7 +981,7 @@ def _count_op_types(ops: list[OpDetails]) -> dict[str, int]:
 
 
 def _format_op_types(type_counts: dict[str, int]) -> str:
-    """Formatiere Op-Typen als kompakte Auflistung mit Counts."""
+    """Format op types as a compact listing with counts."""
     sorted_types = sorted(type_counts.items(), key=lambda x: x[1], reverse=True)
     parts = [f"{count}x {name}" if count > 1 else name for name, count in sorted_types]
     return ", ".join(parts)
@@ -992,11 +992,11 @@ def _print_partition_trace(
     npu_result: BenchmarkResult,
     cpu_result: BenchmarkResult,
 ) -> None:
-    """Zeige Delegate-Partitionierung als Trace-Ausgabe."""
-    header("Trace: Delegate-Partitionierung")
+    """Show delegate partitioning as trace output."""
+    header("Trace: Delegate Partitioning")
 
     if partition_info is None:
-        warn("Delegate-Analyse nicht verfügbar (_get_ops_details() fehlt)")
+        warn("Delegate analysis not available (_get_ops_details() missing)")
         return
 
     num_partitions = partition_info["num_partitions"]
@@ -1007,11 +1007,11 @@ def _print_partition_trace(
     cpu_fallback_types = partition_info["cpu_fallback_types"]
 
     if num_partitions == 0:
-        fail("Teflon hat keine Ops übernommen — alle Ops laufen auf CPU")
+        fail("Teflon did not absorb any ops — all ops run on CPU")
         return
 
     pct = (absorbed / total_ops * 100) if total_ops > 0 else 0
-    ok(f"Teflon: {num_partitions} Partition(en), {absorbed} von {total_ops} Ops absorbiert ({pct:.0f}%)")
+    ok(f"Teflon: {num_partitions} partition(s), {absorbed} of {total_ops} ops absorbed ({pct:.0f}%)")
 
     for i, part in enumerate(partitions, 1):
         op_types = part["op_types"]
@@ -1027,15 +1027,15 @@ def _print_partition_trace(
         for name, count in sorted_fb:
             info(f"    {count:3d}x {name}")
 
-    # Gesamtbewertung
+    # Overall assessment
     if pct > 90:
-        ok(f"Teflon delegiert {pct:.0f}% — NPU wird voll genutzt")
+        ok(f"Teflon delegates {pct:.0f}% — NPU fully utilized")
         if npu_result["mean_ms"] > cpu_result["mean_ms"]:
-            info("NPU trotzdem langsamer als CPU — Rocket-Treiber noch in Entwicklung")
+            info("NPU still slower than CPU — Rocket driver still in development")
     elif pct > 50:
-        warn(f"Teflon delegiert nur {pct:.0f}% — CPU-Fallback bremst")
+        warn(f"Teflon delegates only {pct:.0f}% — CPU fallback slows things down")
     elif pct > 0:
-        warn(f"Teflon delegiert nur {pct:.0f}% — kaum NPU-Nutzung")
+        warn(f"Teflon delegates only {pct:.0f}% — barely any NPU usage")
 
 
 def run_inference_test(model_path: Path, sys_info: SystemInfo, *, trace: bool = False) -> None:
@@ -1127,30 +1127,30 @@ def main() -> None:
     parser.add_argument(
         "--check-int8",
         action="store_true",
-        help="Nur INT8-Quantisierung des Models prüfen (keine Inference)",
+        help="Only check INT8 quantization of the model (no inference)",
     )
     parser.add_argument(
         "--convert-int8",
         type=Path,
         metavar="SOURCE",
-        help="Float-Model zu INT8 konvertieren (SavedModel-Dir, .h5 oder .keras). Output: --convert-int8-output",
+        help="Convert float model to INT8 (SavedModel dir, .h5 or .keras). Output: --convert-int8-output",
     )
     parser.add_argument(
         "--convert-int8-output",
         type=Path,
         default=None,
         metavar="OUTPUT",
-        help="Ausgabepfad für konvertiertes INT8-Model (default: <source>_int8.tflite)",
+        help="Output path for converted INT8 model (default: <source>_int8.tflite)",
     )
     parser.add_argument(
         "--trace",
         action="store_true",
-        help="Zeige Delegate-Trace: Op-Partitionierung (NPU vs CPU), Mesa/Teflon Debug-Output",
+        help="Show delegate trace: op partitioning (NPU vs CPU), Mesa/Teflon debug output",
     )
     parser.add_argument(
         "--model",
         type=Path,
-        help="Pfad zu einem eigenen .tflite Model",
+        help="Path to a custom .tflite model",
     )
     preset_names = list(MODEL_PRESETS.keys())
     parser.add_argument(
@@ -1175,13 +1175,13 @@ def main() -> None:
     if args.convert_int8:
         source = args.convert_int8
         if not source.exists():
-            fail(f"Quell-Model nicht gefunden: {source}")
+            fail(f"Source model not found: {source}")
             sys.exit(1)
         output = args.convert_int8_output
         if output is None:
             stem = source.stem if source.is_file() else source.name
             output = source.parent / f"{stem}_int8.tflite"
-        header("INT8-Konvertierung")
+        header("INT8 Conversion")
         convert_model_int8(source, output)
         print()
         return
@@ -1190,12 +1190,12 @@ def main() -> None:
     if args.check_int8:
         if args.model:
             if not args.model.exists():
-                fail(f"Model nicht gefunden: {args.model}")
+                fail(f"Model not found: {args.model}")
                 sys.exit(1)
             model_path = args.model
         else:
             model_path = download_model(args.preset)
-        header("INT8-Quantisierung")
+        header("INT8 Quantization")
         is_int8 = check_model_int8(model_path)
         print()
         sys.exit(0 if is_int8 else 1)
@@ -1203,7 +1203,7 @@ def main() -> None:
     # Determine model
     if args.model:
         if not args.model.exists():
-            fail(f"Model nicht gefunden: {args.model}")
+            fail(f"Model not found: {args.model}")
             sys.exit(1)
         model_path = args.model
     else:

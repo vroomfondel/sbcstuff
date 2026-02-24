@@ -11,6 +11,20 @@ if [[ -z "${DHREPO:-}" || "$DHREPO" == "UNSET" ]]; then
   echo "DHREPO is not set or 'UNSET' — skipping all DockerHub operations."
 fi
 
+# Derive DH_IS_PRIVATE from DH_REPO_PUBLIC (default: public)
+if [[ "${DH_REPO_PUBLIC:-true}" == "true" ]]; then
+  DH_IS_PRIVATE=false
+else
+  DH_IS_PRIVATE=true
+fi
+
+# Derive GH_VISIBILITY from GH_REPO_PUBLIC (default: public)
+if [[ "${GH_REPO_PUBLIC:-true}" == "true" ]]; then
+  GH_VISIBILITY="--public"
+else
+  GH_VISIBILITY="--private"
+fi
+
 if [[ "$SKIP_DOCKERHUB" == "false" ]]; then
 # Create public DockerHub repo via API
 DHREPO_NS="${DHREPO%%/*}"
@@ -32,7 +46,7 @@ if [[ -z "$DOCKER_TOKEN" || "$DOCKER_TOKEN" != dckr_oat* ]]; then
   curl -s -f -X POST 'https://hub.docker.com/v2/repositories/' \
     -H "Authorization: Bearer $DH_JWT" \
     -H 'Content-Type: application/json' \
-    -d "{\"namespace\":\"$DHREPO_NS\",\"name\":\"$DHREPO_NAME\",\"is_private\":false}"
+    -d "{\"namespace\":\"$DHREPO_NS\",\"name\":\"$DHREPO_NAME\",\"is_private\":$DH_IS_PRIVATE}"
 
   # Docs: https://docs.docker.com/reference/api/hub/latest/#tag/org-access-tokens
   OAT_DESC="CI/CD push token for $DHREPO, created $(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -80,7 +94,7 @@ if [[ "$DHREPO_EXISTS" == "false" ]]; then
     if ! curl -s -f -X POST 'https://hub.docker.com/v2/repositories/' \
       -H "Authorization: Bearer $DH_JWT" \
       -H 'Content-Type: application/json' \
-      -d "{\"namespace\":\"$DHREPO_NS\",\"name\":\"$DHREPO_NAME\",\"is_private\":false}" > /dev/null; then
+      -d "{\"namespace\":\"$DHREPO_NS\",\"name\":\"$DHREPO_NAME\",\"is_private\":$DH_IS_PRIVATE}" > /dev/null; then
       echo "ERROR: Failed to create DockerHub repo $DHREPO" >&2
       exit 129
     fi
@@ -213,7 +227,7 @@ fi
 
 # Create GitHub repo if it doesn't exist yet
 if ! gh repo view "$GHREPO" &>/dev/null; then
-  gh repo create "$GHREPO" --public
+  gh repo create "$GHREPO" $GH_VISIBILITY
   echo "Created GitHub repo: $GHREPO"
 fi
 

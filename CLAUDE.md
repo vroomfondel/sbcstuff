@@ -8,7 +8,7 @@ Collection of standalone shell scripts and a Python test tool for aarch64 SBC (S
 
 1. **LUKS encryption scripts** — Full-disk encryption with clevis/tang (NBDE) for Raspberry Pi and Armbian boards (Rock 5B / RK3588). Three-script workflow: `luks_boot_split.sh` → `luks_prepare.sh` → `luks_encrypt.sh`.
 2. **Rock 5B hardware tools** — Diagnostics (`rock5b-hw-check.sh`), USB boot setup (`rock5b-usb-boot-setup.sh`), NPU benchmarking (`rock5b-npu-test.py`), and Mesa/Teflon NPU driver build (`build-mesa-teflon.sh`).
-3. **Image redaction tool** — `repo_scripts/blurimage.py`: OCR-based screenshot redaction using pytesseract/OpenCV. Multi-pass OCR (weighted, max-channel, blue-channel grayscale), OTSU thresholding, word+line level matching. German output.
+3. **Image redaction tool** — `repo_scripts/blurimage.py`: OCR-based screenshot redaction using pytesseract/OpenCV. Multi-pass OCR (weighted, max-channel, blue-channel grayscale), OTSU thresholding, word+line level matching.
 
 Scripts are organized under `scripts/luks/` (LUKS encryption) and `scripts/rock5b/` (Rock 5B hardware tools). Repository automation lives in `repo_scripts/`.
 
@@ -47,8 +47,8 @@ Scripts detect the board type by checking for config files:
 
 - All shell scripts use `set -euo pipefail` and colored output helpers (`info`, `ok`, `warn`, `fail`).
 - Scripts are designed to run as root (`sudo`).
-- **German output**: `rock5b-npu-test.py`, `rock5b-hw-check.sh`, `rock5b-usb-boot-setup.sh`, `blurimage.py`, `update_badge.py`. `README_ROCKCHIP_5b.md` is also in German.
-- **English output**: `luks_prepare.sh`, `luks_encrypt.sh`, and their README documentation.
+- **German**: `README_ROCKCHIP_5b.md` (documentation only).
+- **English output**: All scripts — `rock5b-hw-check.sh`, `rock5b-npu-test.py`, `rock5b-usb-boot-setup.sh`, `blurimage.py`, `update_badge.py`, `luks_prepare.sh`, `luks_encrypt.sh`, and their README documentation.
 
 ## Rock 5B NPU context
 

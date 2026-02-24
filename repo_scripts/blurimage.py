@@ -58,7 +58,11 @@ Tesseract returns bounding boxes per WORD. Patterns are matched at two levels:
   Word-level matching:
     Each OCR word is individually checked against the pattern. This catches simple
     cases like a username ("henning") or domain ("elasticc.io") appearing within a
-    single word token. Only the matching word's bounding box is blurred.
+    single word token. Only the matched CHARACTER RANGE within the word is blurred,
+    not the entire word. This is calculated proportionally from the word's bounding
+    box, assuming monospaced fonts (typical for terminal screenshots). This enables
+    lookahead/lookbehind patterns like "[0-9a-f]{5,}(?=\.mp4)" to blur the hash
+    without touching the ".mp4" extension.
 
   Line-level matching:
     Words are grouped into lines using Tesseract's (block_num, par_num, line_num)
@@ -116,6 +120,8 @@ Tesseract returns bounding boxes per WORD. Patterns are matched at two levels:
   System:  tesseract-ocr (apt install tesseract-ocr)
   Python:  pytesseract, opencv-python (auto-installed if missing)
 """
+
+__version__ = "2026-02-23_111111"
 
 
 def install_and_import(packagename: str, pipname: str) -> None:
@@ -263,7 +269,7 @@ def main() -> None:
     # Hardcoded filename patterns are also case-insensitive.
     parts = [rf"(?i:{re.escape(phrase)})" for phrase in args.blur]
     parts += list(args.blur_regex)
-    parts += [r"(?i:PXL.*)", r"(?i:.*\.png$)", r"(?i:.*\.jpg$)", r"(?i:.*\.mp4$)", r"(?i:.*\.json$)"]
+    # parts += [r"(?i:PXL.*)", r"(?i:.*\.png$)", r"(?i:.*\.jpg$)", r"(?i:.*\.mp4$)", r"(?i:.*\.json$)"]
     pattern = re.compile(rf"({'|'.join(parts)})")
 
     # --- Group OCR words into lines ---
@@ -279,21 +285,27 @@ def main() -> None:
         lines[key].append(i)
 
     if args.debug:
-        print("--- OCR erkannte Zeilen ---")
+        print("--- OCR detected lines ---")
         for key in sorted(lines):
             line_text = " ".join(d["text"][i].strip() for i in lines[key])
-            print(f"  Zeile {key}: {line_text}")
+            print(f"  Line {key}: {line_text}")
         print("---")
 
-    blur_indices: set[int] = set()
+    # Each entry: (box_index, char_start_in_word, char_end_in_word)
+    # This allows sub-word blurring: only the matched character range within a word
+    # is blurred, not the entire word's bounding box.
+    blur_regions: list[tuple[int, int, int]] = []
 
     # --- Stage 1: Word-level matching ---
     # Check each individual OCR word against the pattern. This catches single-word
     # matches like usernames, domains within compound tokens, etc.
+    # Uses finditer to record the exact match span within the word for sub-word blurring.
     for i in range(n_boxes):
         text = d["text"][i].strip()
-        if text and pattern.search(text):
-            blur_indices.add(i)
+        if not text:
+            continue
+        for match in pattern.finditer(text):
+            blur_regions.append((i, match.start(), match.end()))
 
     # --- Stage 2: Line-level matching (targeted, not whole-line) ---
     # For patterns that span multiple words (e.g. "session id \S+"), we join words
@@ -303,8 +315,9 @@ def main() -> None:
     # the individual words that overlap with the match. This way only the actually
     # matched words are blurred, keeping non-sensitive context (timestamps, log
     # prefixes like "Received a undecryptable...") readable.
+    matched_word_indices = {i for i, _, _ in blur_regions}
     for key, indices in lines.items():
-        if all(i in blur_indices for i in indices):
+        if all(i in matched_word_indices for i in indices):
             continue  # all words already matched at word level, skip
 
         # Track character position of each word in the joined line text
@@ -318,26 +331,43 @@ def main() -> None:
 
         line_text = " ".join(d["text"][i].strip() for i in indices)
 
-        # Find all pattern matches in the line and blur only overlapping words
+        # Find all pattern matches in the line and blur only overlapping words.
+        # Calculate the intersection of the match span with each word span to
+        # determine which portion of each overlapping word should be blurred.
         for match in pattern.finditer(line_text):
             ms, me = match.span()
             for ws, we, i in word_spans:
                 if ws < me and we > ms:  # word overlaps with match span
-                    blur_indices.add(i)
+                    word_text = d["text"][i].strip()
+                    overlap_start = max(0, ms - ws)
+                    overlap_end = min(len(word_text), me - ws)
+                    blur_regions.append((i, overlap_start, overlap_end))
 
-    # --- Apply Gaussian blur to all matched bounding boxes ---
+    # --- Apply Gaussian blur to matched bounding box sub-regions ---
+    # For monospaced terminal fonts, character width is uniform, so the blur region
+    # is calculated proportionally: match_start/word_len * box_width.
     # Kernel size (31,31) and sigma 30 produce a strong blur that makes text unreadable.
     # The blur is applied on the ORIGINAL image (not the preprocessed OCR image).
-    for i in sorted(blur_indices):
+    for i, cs, ce in sorted(blur_regions):
+        text = d["text"][i].strip()
+        word_len = len(text)
+        if word_len == 0:
+            continue
         x, y, w, h = (d["left"][i], d["top"][i], d["width"][i], d["height"][i])
-        roi = img[y : y + h, x : x + w]
-        blur = cv2.GaussianBlur(roi, (31, 31), 30)
-        img[y : y + h, x : x + w] = blur
-        print(f"Geblurrt: {d['text'][i].strip()}")
+        # Proportional sub-region based on character positions
+        x_start = x + int((cs / word_len) * w)
+        x_end = x + int((ce / word_len) * w)
+        sub_w = x_end - x_start
+        if sub_w <= 0:
+            continue
+        roi = img[y : y + h, x_start : x_start + sub_w]
+        blur_region = cv2.GaussianBlur(roi, (31, 31), 30)
+        img[y : y + h, x_start : x_start + sub_w] = blur_region
+        print(f"Blurred: {text[cs:ce]}")
 
     # Save as PNG for lossless quality of the non-blurred regions
     cv2.imwrite(output_path, img)
-    print(f"Fertig! Bild gespeichert unter {output_path}")
+    print(f"Done! Image saved to {output_path}")
 
 
 if __name__ == "__main__":
