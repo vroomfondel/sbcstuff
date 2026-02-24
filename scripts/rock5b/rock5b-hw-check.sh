@@ -713,7 +713,88 @@ else
 fi
 
 ###############################################################################
-#  6. Thermal & Fan
+#  6. HDMI / Display Output
+###############################################################################
+
+header "HDMI / Display Output"
+
+# ── DRM connectors ──
+HDMI_CONNECTORS=(/sys/class/drm/card0-HDMI-A-*/status)
+if [[ -e "${HDMI_CONNECTORS[0]}" ]]; then
+    for STATUS_FILE in "${HDMI_CONNECTORS[@]}"; do
+        CONN_NAME=$(basename "$(dirname "$STATUS_FILE")" | sed 's/^card0-//')
+        CONN_STATUS=$(cat "$STATUS_FILE" 2>/dev/null || echo "unknown")
+        if [[ "$CONN_STATUS" == "connected" ]]; then
+            ok "Connector ${BOLD}$CONN_NAME${NC} is ${GREEN}connected${NC}"
+        else
+            warn "Connector ${BOLD}$CONN_NAME${NC} is ${YELLOW}disconnected${NC}"
+        fi
+    done
+else
+    fail "No HDMI connectors found in /sys/class/drm/"
+    ((ISSUES_FOUND++))
+fi
+
+# ── EDID presence ──
+for EDID_FILE in /sys/class/drm/card0-HDMI-A-*/edid; do
+    [[ -e "$EDID_FILE" ]] || continue
+    CONN_NAME=$(basename "$(dirname "$EDID_FILE")" | sed 's/^card0-//')
+    EDID_SIZE=$(wc -c < "$EDID_FILE" 2>/dev/null || echo 0)
+    if [[ "$EDID_SIZE" -gt 0 ]]; then
+        ok "EDID detected for ${BOLD}$CONN_NAME${NC} (${EDID_SIZE} bytes)"
+    else
+        warn "No EDID for ${BOLD}$CONN_NAME${NC} — monitor may not respond at boot"
+    fi
+done
+
+# ── Active modes ──
+for MODES_FILE in /sys/class/drm/card0-HDMI-A-*/modes; do
+    [[ -e "$MODES_FILE" ]] || continue
+    CONN_NAME=$(basename "$(dirname "$MODES_FILE")" | sed 's/^card0-//')
+    MODES=$(head -5 "$MODES_FILE" 2>/dev/null || true)
+    if [[ -n "$MODES" ]]; then
+        info "Modes for ${BOLD}$CONN_NAME${NC}:"
+        echo "$MODES" | while read -r mode; do echo "      $mode"; done
+    else
+        warn "No modes available for ${BOLD}$CONN_NAME${NC}"
+    fi
+done
+
+# ── VOP / Display dmesg ──
+echo ""
+info "Display-related kernel messages:"
+HDMI_DMESG=$(dmesg 2>/dev/null | grep -iE 'hdmi|vop|rockchip.drm|dw.hdmi|edid' | tail -10 || true)
+if [[ -n "$HDMI_DMESG" ]]; then
+    echo "$HDMI_DMESG" | while read -r line; do echo "      $line"; done
+    if echo "$HDMI_DMESG" | grep -qi 'Cannot find any crtc or sizes'; then
+        warn "Display controller failed to find CRTC/sizes — likely EDID/timing issue"
+        info "Hint: add ${BOLD}extraargs=video=HDMI-A-1:1920x1080@60e${NC} to /boot/armbianEnv.txt"
+    fi
+else
+    info "No HDMI/VOP messages in dmesg"
+fi
+
+# ── HDMI kernel modules ──
+echo ""
+if lsmod 2>/dev/null | grep -qE 'dwhdmiqp_rockchip|dw_hdmi'; then
+    HDMI_MOD=$(lsmod | grep -oE 'dwhdmiqp_rockchip|dw_hdmi' | head -1)
+    ok "HDMI kernel module loaded: ${BOLD}$HDMI_MOD${NC}"
+else
+    fail "No HDMI kernel module loaded (dwhdmiqp_rockchip / dw_hdmi)"
+    ((ISSUES_FOUND++))
+fi
+
+# ── Kernel video= parameter ──
+CMDLINE_VIDEO=$(grep -oE 'video=HDMI[^ ]*' /proc/cmdline 2>/dev/null || true)
+if [[ -n "$CMDLINE_VIDEO" ]]; then
+    info "Kernel video parameter: ${BOLD}$CMDLINE_VIDEO${NC}"
+else
+    info "No ${BOLD}video=HDMI${NC} kernel parameter set"
+    info "Hint: add ${BOLD}extraargs=video=HDMI-A-1:1920x1080@60e${NC} to force HDMI output without EDID"
+fi
+
+###############################################################################
+#  7. Thermal & Fan
 ###############################################################################
 
 header "Thermal & Fan"
@@ -781,7 +862,7 @@ else
 fi
 
 ###############################################################################
-#  7. Fix mode
+#  8. Fix mode
 ###############################################################################
 
 if $FIX_MODE; then
@@ -1199,7 +1280,7 @@ else
 fi
 
 ###############################################################################
-#  8. Summary
+#  9. Summary
 ###############################################################################
 
 header "Summary"
@@ -1297,6 +1378,9 @@ echo "    dd if=/dev/mtdblock0 bs=512 count=1 | od -t x1    # Check SPI flash co
 echo "    strings /dev/mtdblock0 | grep 'U-Boot'            # U-Boot version in SPI"
 echo "    cat /sys/class/mtd/mtd0/{size,name,type}           # MTD device info"
 echo "    zgrep -E 'ROCKET|RKNPU|PANTHOR' /proc/config.gz   # Check kernel config"
+echo "    cat /sys/class/drm/card0-HDMI-A-*/status           # HDMI connector status"
+echo "    cat /sys/class/drm/card0-HDMI-A-*/modes            # Available display modes"
+echo "    dmesg | grep -iE 'hdmi|vop|edid'                   # Display kernel messages"
 echo "    cat /sys/class/thermal/cooling_device*/type        # Cooling device types"
 echo "    cat /sys/class/thermal/thermal_zone*/temp          # All thermal zone temps"
 echo ""
