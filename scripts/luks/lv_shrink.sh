@@ -27,6 +27,7 @@ MIN_LV_SIZE_MB=512             # Minimum LV size after shrink (MiB)
 FS_SHRINK_BUFFER_MB=64         # Safety buffer: filesystem is shrunk this much smaller than LV target
 HOOK_FILE="/etc/initramfs-tools/hooks/lv-shrink"
 PREMOUNT_FILE="/etc/initramfs-tools/scripts/local-premount/lv-shrink"
+CLEANUP_SERVICE="/etc/systemd/system/lv-shrink-cleanup.service"
 LOG_FILE="/run/lv-shrink-initrd.log"
 
 # --- Colors ---
@@ -469,6 +470,8 @@ else
   STEP_NUM=$((STEP_NUM + 1))
   echo "    ${STEP_NUM}. Self-destruct (remove initramfs hooks)"
   STEP_NUM=$((STEP_NUM + 1))
+  echo "    ${STEP_NUM}. Schedule initramfs rebuild (systemd oneshot service)"
+  STEP_NUM=$((STEP_NUM + 1))
   echo "    ${STEP_NUM}. Log results to $LOG_FILE"
   echo ""
 
@@ -547,11 +550,30 @@ fi
 e2fsck -f -y "\${TARGET_DEV}" 2>> "\${RUN_LOG}" || true
 resize2fs -f "\${TARGET_DEV}" 2>> "\${RUN_LOG}"
 
-# Self-destruct
+# Self-destruct and schedule initramfs rebuild
 TMPROOT=\$(mktemp -d)
 if mount "\${TARGET_DEV}" "\${TMPROOT}"; then
   rm -f "\${TMPROOT}${HOOK_FILE}" "\${TMPROOT}${PREMOUNT_FILE}"
   log_msg "Removed initramfs hooks from root filesystem"
+
+  # Install oneshot service to rebuild initramfs on next boot
+  cat > "\${TMPROOT}${CLEANUP_SERVICE}" << 'SVCEOF'
+[Unit]
+Description=LV shrink cleanup - rebuild initramfs without shrink tools
+After=local-fs.target
+ConditionPathExists=${CLEANUP_SERVICE}
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'update-initramfs -u -k all; systemctl disable lv-shrink-cleanup.service; rm -f ${CLEANUP_SERVICE}'
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+  mkdir -p "\${TMPROOT}/etc/systemd/system/multi-user.target.wants"
+  ln -sf "${CLEANUP_SERVICE}" "\${TMPROOT}/etc/systemd/system/multi-user.target.wants/lv-shrink-cleanup.service"
+  log_msg "Installed cleanup service for initramfs rebuild"
+
   umount "\${TMPROOT}"
 else
   log_msg "WARNING: Could not mount root for self-destruct"
@@ -677,13 +699,32 @@ log_msg "Expanding filesystem to fill LV..."
 e2fsck -f -y "\${TARGET_DEV}" 2>> "\${RUN_LOG}" || true
 resize2fs -f "\${TARGET_DEV}" 2>> "\${RUN_LOG}"
 
-# Step 6: Self-destruct — mount root, remove hooks
+# Step 6: Self-destruct — mount root, remove hooks, schedule initramfs rebuild
 log_msg "Self-destructing hooks..."
 TMPROOT=\$(mktemp -d)
 if mount "\${TARGET_DEV}" "\${TMPROOT}"; then
   rm -f "\${TMPROOT}${HOOK_FILE}"
   rm -f "\${TMPROOT}${PREMOUNT_FILE}"
   log_msg "Removed initramfs hooks from root filesystem"
+
+  # Install oneshot service to rebuild initramfs on next boot (removes shrink tools from initrd)
+  cat > "\${TMPROOT}${CLEANUP_SERVICE}" << 'SVCEOF'
+[Unit]
+Description=LV shrink cleanup - rebuild initramfs without shrink tools
+After=local-fs.target
+ConditionPathExists=${CLEANUP_SERVICE}
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'update-initramfs -u -k all; systemctl disable lv-shrink-cleanup.service; rm -f ${CLEANUP_SERVICE}'
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+  mkdir -p "\${TMPROOT}/etc/systemd/system/multi-user.target.wants"
+  ln -sf "${CLEANUP_SERVICE}" "\${TMPROOT}/etc/systemd/system/multi-user.target.wants/lv-shrink-cleanup.service"
+  log_msg "Installed cleanup service for initramfs rebuild"
+
   umount "\${TMPROOT}"
 else
   log_msg "WARNING: Could not mount root for self-destruct — hooks remain, remove manually"
@@ -738,9 +779,12 @@ SCRIPTEOF
   echo "     df -h                                  — check filesystem size"
   echo "     cat $LOG_FILE   — check shrink log"
   echo "     (log is on tmpfs — save it before next reboot)"
+  echo "  4. A cleanup service will automatically rebuild the initramfs"
+  echo "     (removes shrink tools from initrd, then self-destructs)"
   echo ""
   echo -e "${CYAN}Installed hooks (self-destruct after successful shrink):${NC}"
   echo "  $HOOK_FILE"
   echo "  $PREMOUNT_FILE"
+  echo "  Cleanup: $CLEANUP_SERVICE (runs once after successful boot)"
   echo ""
 fi
