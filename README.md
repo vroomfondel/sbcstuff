@@ -10,26 +10,26 @@ These scripts were extracted from a larger infrastructure repo because the Rock 
 
 ## Contents
 
-| Script | Purpose | Runs on |
-|--------|---------|---------|
-| `scripts/luks/luks_prepare.sh` | Prepare a board for LUKS encryption (packages, initramfs, boot config) | Target board (RPi / Rock 5B) |
-| `scripts/luks/luks_encrypt.sh` | Encrypt root partition with LUKS + clevis/tang auto-unlock | External machine (RPi) or target board (Armbian NVMe/USB) or SD-booted board against eMMC |
-| `scripts/luks/luks_boot_split.sh` | Split `/boot` into a separate partition (required for Armbian in-place encryption) | Target board (on-board mode) or external machine (external mode) |
-| `scripts/luks/lv_shrink.sh` | Interactively shrink an LVM Logical Volume (ext4, offline or via initrd) | Target board |
-| `scripts/luks/setup_clevis_tang.sh` | (Re-)bind clevis/tang NBDE on an already-encrypted LUKS device | Target board (already encrypted) |
-| `scripts/luks/tang_check_connection.sh` | Test clevis/tang connectivity and decryption on a LUKS device | Target board (already encrypted) |
-| `scripts/luks/initramfs_local-bottom_cleanup-netplan` | Initramfs hook: removes stale netplan YAML from boot-time DHCP | Automatisch im Initramfs (nicht manuell) |
-| `scripts/rock5b/rock5b-hw-check.sh` | Hardware diagnostics for Rock 5B (NPU, GPU, SPI flash, boot chain) | Rock 5B |
-| `scripts/rock5b/rock5b-usb-boot-setup.sh` | Interactive USB boot setup for Rock 5B (SPI flash + boot order) | Rock 5B |
-| `scripts/rock5b/rock5b-npu-test.py` | NPU benchmark (Rocket/Teflon stack, kernel ≥6.18) | Rock 5B |
-| `scripts/rock5b/build-mesa-teflon.sh` | Build Mesa libteflon.so (Rocket/RK3588 NPU) from source | Rock 5B (aarch64, native build) |
-| `scripts/rock5b/release-mesa-teflon.sh` | Create a GitHub Release with libteflon.so tarball | Dev-Rechner oder Rock 5B (braucht `gh` CLI) |
+| Script                                                | Purpose                                                                            | Runs on                                                                                   |
+|-------------------------------------------------------|------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------|
+| `scripts/luks/luks_prepare.sh`                        | Prepare a board for LUKS encryption (packages, initramfs, boot config)             | Target board (RPi / Rock 5B)                                                              |
+| `scripts/luks/luks_encrypt.sh`                        | Encrypt root partition with LUKS + clevis/tang auto-unlock                         | External machine (RPi) or target board (Armbian NVMe/USB) or SD-booted board against eMMC |
+| `scripts/luks/luks_boot_split.sh`                     | Split `/boot` into a separate partition (required for Armbian in-place encryption) | Target board (on-board mode) or external machine (external mode)                          |
+| `scripts/luks/lv_shrink.sh`                           | Interactively shrink an LVM Logical Volume (ext4, offline or via initrd)           | Target board                                                                              |
+| `scripts/luks/setup_clevis_tang.sh`                   | (Re-)bind clevis/tang NBDE on an already-encrypted LUKS device                     | Target board (already encrypted)                                                          |
+| `scripts/luks/tang_check_connection.sh`               | Test clevis/tang connectivity and decryption on a LUKS device                      | Target board (already encrypted)                                                          |
+| `scripts/luks/initramfs_local-bottom_cleanup-netplan` | Initramfs hook: removes stale netplan YAML from boot-time DHCP                     | Automatisch im Initramfs (nicht manuell)                                                  |
+| `scripts/rock5b/rock5b-hw-check.sh`                   | Hardware diagnostics for Rock 5B (NPU, GPU, SPI flash, boot chain)                 | Rock 5B                                                                                   |
+| `scripts/rock5b/rock5b-usb-boot-setup.sh`             | Interactive USB boot setup for Rock 5B (SPI flash + boot order)                    | Rock 5B                                                                                   |
+| `scripts/rock5b/rock5b-npu-test.py`                   | NPU benchmark (Rocket/Teflon stack, kernel ≥6.18)                                  | Rock 5B                                                                                   |
+| `scripts/rock5b/build-mesa-teflon.sh`                 | Build Mesa libteflon.so (Rocket/RK3588 NPU) from source                            | Rock 5B (aarch64, native build)                                                           |
+| `scripts/rock5b/release-mesa-teflon.sh`               | Create a GitHub Release with libteflon.so tarball                                  | Dev-Rechner oder Rock 5B (braucht `gh` CLI)                                               |
 
 ### Makefile Targets (dev workstation)
 
-| Target | Description |
-|--------|-------------|
-| `make teflon-fetch` | Fetch libteflon.so build artifacts from Rock 5B via rsync |
+| Target                | Description                                                 |
+|-----------------------|-------------------------------------------------------------|
+| `make teflon-fetch`   | Fetch libteflon.so build artifacts from Rock 5B via rsync   |
 | `make teflon-release` | Fetch artifacts + create GitHub Release (requires `gh` CLI) |
 
 Override the Rock 5B host: `make teflon-release ROCK5B_HOST=root@10.0.0.5`
@@ -44,19 +44,19 @@ Standalone scripts for LUKS-encrypting root partitions with clevis/tang auto-unl
 
 ### Supported Boards
 
-| Board | Boot mechanism | Boot partition | Boot config | Kernel postinst | SPI flash |
-|-------|---------------|----------------|-------------|-----------------|-----------|
-| Raspberry Pi | `/boot/firmware` (FAT32, separate partition) | Already separate | `cmdline.txt` + `config.txt` | Custom hook (initramfs-rebuild) | N/A |
-| Armbian/U-Boot (Rock 5B) | `/boot` (ext4, on root partition) | Must be split out | `armbianEnv.txt` | Armbian's own hooks | Auto-offered for RK3588 NVMe/USB migration |
+| Board                    | Boot mechanism                               | Boot partition    | Boot config                  | Kernel postinst                 | SPI flash                                  |
+|--------------------------|----------------------------------------------|-------------------|------------------------------|---------------------------------|--------------------------------------------|
+| Raspberry Pi             | `/boot/firmware` (FAT32, separate partition) | Already separate  | `cmdline.txt` + `config.txt` | Custom hook (initramfs-rebuild) | N/A                                        |
+| Armbian/U-Boot (Rock 5B) | `/boot` (ext4, on root partition)            | Must be split out | `armbianEnv.txt`             | Armbian's own hooks             | Auto-offered for RK3588 NVMe/USB migration |
 
 ### Supported Scenarios
 
-| Scenario | Board | Workflow |
-|----------|-------|----------|
-| A: RPi (external encrypt) | RPi | `prepare` on Pi → SD/NVMe out → `encrypt` on external machine |
-| B: NVMe migration | Armbian | `prepare` AND `encrypt` both run on the board (NVMe != boot disk) |
-| C: USB migration | Armbian | `prepare` AND `encrypt` both run on the board (USB SSD != boot disk) |
-| D: In-place eMMC (on-board split) | Armbian | `boot_split` on board → reboot → `prepare` on board → boot from SD → `encrypt` against eMMC |
+| Scenario                          | Board   | Workflow                                                                                                                         |
+|-----------------------------------|---------|----------------------------------------------------------------------------------------------------------------------------------|
+| A: RPi (external encrypt)         | RPi     | `prepare` on Pi → SD/NVMe out → `encrypt` on external machine                                                                    |
+| B: NVMe migration                 | Armbian | `prepare` AND `encrypt` both run on the board (NVMe != boot disk)                                                                |
+| C: USB migration                  | Armbian | `prepare` AND `encrypt` both run on the board (USB SSD != boot disk)                                                             |
+| D: In-place eMMC (on-board split) | Armbian | `boot_split` on board → reboot → `prepare` on board → boot from SD → `encrypt` against eMMC                                      |
 | E: In-place eMMC (external split) | Armbian | SD card out → `boot_split --external` on external machine → SD back → `prepare` on board → boot from SD → `encrypt` against eMMC |
 
 ### Storage Stack
@@ -128,15 +128,15 @@ Alternative: split the boot partition on an external machine without rebooting t
 
 Both scripts share the same configuration block at the top. **Values must match between the two scripts.**
 
-| Variable | Default | Description |
-|---|---|---|
-| `TANG_SERVERS` | `("" "")` | Tang server URLs for clevis binding. `luks_prepare.sh` writes them to `luks.conf`; `luks_encrypt.sh` reads them from there (prompted at runtime only if still empty) |
-| `SSS_THRESHOLD` | `2` | Shamir's Secret Sharing threshold (number of tang servers required) |
-| `LUKS_MAPPER_NAME` | `rootfs` | LUKS device mapper name (`/dev/mapper/<name>`) |
-| `USE_LVM` | `true` | Enable LVM layer inside LUKS |
-| `LVM_VG_NAME` | `pivg` | LVM volume group name (only when `USE_LVM=true`) |
-| `LVM_LV_NAME` | `root` | LVM logical volume name (only when `USE_LVM=true`) |
-| `LVM_ROOT_SIZE` | _(empty = 100%FREE)_ | LV size — override via `--lv-size=<size>` (e.g., `50G`, `50%FREE`) |
+| Variable           | Default              | Description                                                                                                                                                          |
+|--------------------|----------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `TANG_SERVERS`     | `("" "")`            | Tang server URLs for clevis binding. `luks_prepare.sh` writes them to `luks.conf`; `luks_encrypt.sh` reads them from there (prompted at runtime only if still empty) |
+| `SSS_THRESHOLD`    | `2`                  | Shamir's Secret Sharing threshold (number of tang servers required)                                                                                                  |
+| `LUKS_MAPPER_NAME` | `rootfs`             | LUKS device mapper name (`/dev/mapper/<name>`)                                                                                                                       |
+| `USE_LVM`          | `true`               | Enable LVM layer inside LUKS                                                                                                                                         |
+| `LVM_VG_NAME`      | `pivg`               | LVM volume group name (only when `USE_LVM=true`)                                                                                                                     |
+| `LVM_LV_NAME`      | `root`               | LVM logical volume name (only when `USE_LVM=true`)                                                                                                                   |
+| `LVM_ROOT_SIZE`    | _(empty = 100%FREE)_ | LV size — override via `--lv-size=<size>` (e.g., `50G`, `50%FREE`)                                                                                                   |
 
 ### Script Details
 
@@ -200,12 +200,12 @@ sudo ./luks_boot_split.sh -h                   # show help
 
 **CLI flags:**
 
-| Flag | Description |
-|------|-------------|
-| `--external` | Force external mode, auto-detect removable device |
-| `--external /dev/sdX` | External mode with explicit device |
-| `--external=/dev/sdX` | Same, alternate syntax |
-| `-h`, `--help` | Show help and exit |
+| Flag                  | Description                                       |
+|-----------------------|---------------------------------------------------|
+| `--external`          | Force external mode, auto-detect removable device |
+| `--external /dev/sdX` | External mode with explicit device                |
+| `--external=/dev/sdX` | Same, alternate syntax                            |
+| `-h`, `--help`        | Show help and exit                                |
 
 **External mode** auto-activates when not running on an Armbian system (no `/boot/armbianEnv.txt`). It auto-detects removable/USB block devices, excluding the host root disk. If multiple candidates are found, it presents a selection menu.
 
@@ -277,10 +277,10 @@ sudo ./lv_shrink.sh -h           # show help
 
 **CLI flags:**
 
-| Flag | Description |
-|------|-------------|
-| `--dry-run` | Show all commands/hook content without making changes |
-| `-h`, `--help` | Show help and exit |
+| Flag           | Description                                           |
+|----------------|-------------------------------------------------------|
+| `--dry-run`    | Show all commands/hook content without making changes |
+| `-h`, `--help` | Show help and exit                                    |
 
 **What it does (interactive flow):**
 
@@ -348,14 +348,14 @@ sudo ./luks_encrypt.sh -h                                       # show help
 
 **CLI flags:**
 
-| Flag | Description |
-|------|-------------|
+| Flag                        | Description                                                                                                                       |
+|-----------------------------|-----------------------------------------------------------------------------------------------------------------------------------|
 | `--start-phase=<name\|num>` | Resume from a specific phase (by name or number 1-8). Auto-sets up prerequisites (opens LUKS, mounts partitions, locates backup). |
-| `--backup-dir=<path>` | Specify backup directory explicitly (required when resuming if multiple backups exist). |
-| `--lv-size=<size>` | Set root LV size instead of 100%FREE (e.g., `50G`, `50%FREE`). Only applies when `USE_LVM=true`. |
-| `--list-phases` | Print all phases with descriptions and exit. |
-| `--spi-only` | Skip all encryption, run only the SPI U-Boot flash for RK3588 NVMe/USB boot. |
-| `-h`, `--help` | Show help and exit. |
+| `--backup-dir=<path>`       | Specify backup directory explicitly (required when resuming if multiple backups exist).                                           |
+| `--lv-size=<size>`          | Set root LV size instead of 100%FREE (e.g., `50G`, `50%FREE`). Only applies when `USE_LVM=true`.                                  |
+| `--list-phases`             | Print all phases with descriptions and exit.                                                                                      |
+| `--spi-only`                | Skip all encryption, run only the SPI U-Boot flash for RK3588 NVMe/USB boot.                                                      |
+| `-h`, `--help`              | Show help and exit.                                                                                                               |
 
 **Modes:**
 
@@ -373,16 +373,16 @@ sudo ./luks_encrypt.sh -h                                       # show help
 
 The script is organized into 8 resumable phases. Each phase is gated — when using `--start-phase`, earlier phases are skipped and prerequisites (LUKS open, mounts, backup directory) are automatically set up.
 
-| # | Phase | Description |
-|---|-------|-------------|
-| 1 | `detect` | Device detection, board type, confirmation |
-| 2 | `backup` | Root partition backup via rsync (skipped for NVMe/USB migration — data is copied directly in restore phase) |
-| 3 | `encrypt` | Stale device cleanup, `wipefs`, LUKS2 format + open with user-provided passphrase |
-| 4 | `restore` | Create filesystem (+ LVM if enabled), rsync restore, file count verification |
+| # | Phase        | Description                                                                                                                                                                          |
+|---|--------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| 1 | `detect`     | Device detection, board type, confirmation                                                                                                                                           |
+| 2 | `backup`     | Root partition backup via rsync (skipped for NVMe/USB migration — data is copied directly in restore phase)                                                                          |
+| 3 | `encrypt`    | Stale device cleanup, `wipefs`, LUKS2 format + open with user-provided passphrase                                                                                                    |
+| 4 | `restore`    | Create filesystem (+ LVM if enabled), rsync restore, file count verification                                                                                                         |
 | 5 | `bootconfig` | Board-specific boot config: RPi (`cmdline.txt` + `config.txt`), Armbian (`armbianEnv.txt`), both (`/etc/crypttab`, `/etc/fstab`, `cleanup-netplan` hook, `tang_check_connection.sh`) |
-| 6 | `initramfs` | Chroot + `update-initramfs`; Armbian also ensures `uInitrd` (U-Boot wrapped) via `mkimage` |
-| 7 | `clevis` | Clevis/Tang SSS binding (prompts for LUKS passphrase if not already available) |
-| 8 | `verify` | Verification (clevis bindings, initramfs hooks), cleanup, SPI U-Boot flash (RK3588 NVMe/USB migration) |
+| 6 | `initramfs`  | Chroot + `update-initramfs`; Armbian also ensures `uInitrd` (U-Boot wrapped) via `mkimage`                                                                                           |
+| 7 | `clevis`     | Clevis/Tang SSS binding (prompts for LUKS passphrase if not already available)                                                                                                       |
+| 8 | `verify`     | Verification (clevis bindings, initramfs hooks), cleanup, SPI U-Boot flash (RK3588 NVMe/USB migration)                                                                               |
 
 **Resuming after failure:**
 
@@ -429,13 +429,13 @@ sudo /root/setup_clevis_tang.sh <passphrase>   # non-interactive LUKS passphrase
 
 **Configuration variables** at the top of the script (leave empty to be prompted interactively):
 
-| Variable | Default | Description |
-|---|---|---|
-| `LUKS_DEVICE` | _(empty)_ | LUKS partition (e.g. `/dev/nvme0n1p2`). Auto-detected from `/etc/crypttab` if empty. |
-| `NETWORK_INTERFACE` | _(empty)_ | Network interface for initramfs (e.g. `eth0`, `end0`) |
-| `TANG_SERVERS` | `("" "")` | Tang server URLs |
-| `SSS_THRESHOLD` | `2` | Shamir's Secret Sharing threshold |
-| `IP_METHOD` | `dhcp` | Initramfs IP config (`dhcp` or full kernel `ip=` string) |
+| Variable            | Default   | Description                                                                          |
+|---------------------|-----------|--------------------------------------------------------------------------------------|
+| `LUKS_DEVICE`       | _(empty)_ | LUKS partition (e.g. `/dev/nvme0n1p2`). Auto-detected from `/etc/crypttab` if empty. |
+| `NETWORK_INTERFACE` | _(empty)_ | Network interface for initramfs (e.g. `eth0`, `end0`)                                |
+| `TANG_SERVERS`      | `("" "")` | Tang server URLs                                                                     |
+| `SSS_THRESHOLD`     | `2`       | Shamir's Secret Sharing threshold                                                    |
+| `IP_METHOD`         | `dhcp`    | Initramfs IP config (`dhcp` or full kernel `ip=` string)                             |
 
 **What it does:**
 
@@ -574,14 +574,14 @@ sudo ./scripts/rock5b/rock5b-hw-check.sh --fix    # attempt to fix issues (remov
 
 **Checks performed:**
 
-| Section | What it checks |
-|---------|---------------|
-| System overview | Hostname, kernel version, Armbian release, vendor vs mainline kernel detection |
-| SPI flash & boot source | SPI content analysis, boot chain tracing, available boot media |
-| Boot config | `armbianEnv.txt` overlays, harmful NPU overlay detection |
-| NPU status | Rocket accel device (`/dev/accel/accel0`), DRM device (`/dev/dri/by-path/platform-fdab0000.npu-render`), legacy `/dev/rknpu*`, kernel module/built-in (rocket or rknpu), devfreq frequencies, dmesg |
-| GPU status | Mali G610 DRM device, driver detection (mali/panfrost/panthor/bifrost), utilization |
-| DRI overview | All `/dev/dri/by-path/*-render` devices with driver names |
+| Section                 | What it checks                                                                                                                                                                                      |
+|-------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| System overview         | Hostname, kernel version, Armbian release, vendor vs mainline kernel detection                                                                                                                      |
+| SPI flash & boot source | SPI content analysis, boot chain tracing, available boot media                                                                                                                                      |
+| Boot config             | `armbianEnv.txt` overlays, harmful NPU overlay detection                                                                                                                                            |
+| NPU status              | Rocket accel device (`/dev/accel/accel0`), DRM device (`/dev/dri/by-path/platform-fdab0000.npu-render`), legacy `/dev/rknpu*`, kernel module/built-in (rocket or rknpu), devfreq frequencies, dmesg |
+| GPU status              | Mali G610 DRM device, driver detection (mali/panfrost/panthor/bifrost), utilization                                                                                                                 |
+| DRI overview            | All `/dev/dri/by-path/*-render` devices with driver names                                                                                                                                           |
 
 **SPI flash analysis:**
 
@@ -614,13 +614,13 @@ Shows how the boot source is determined, not just what it is:
 
 **Kernel support tiers:**
 
-| Kernel | GPU driver | NPU (RKNPU) | Notes |
-|--------|-----------|-------------|-------|
-| Vendor/BSP 6.1.x | mali (blob) | Built-in (DRM, 0.9.x) | Rockchip patches, stable but older |
-| Mainline 6.12–6.13 | panthor | Not yet | panthor replaces panfrost for Valhall |
-| Mainline 6.14–6.17 | panthor | Experimental | RKNPU merged but not yet stable |
-| **Mainline ≥6.18** | **panthor** | **Stable** | **Recommended — full NPU+GPU, better security** |
-| Mainline <6.12 | panfrost (limited) | No | Mali G610 poorly supported |
+| Kernel             | GPU driver         | NPU (RKNPU)           | Notes                                           |
+|--------------------|--------------------|-----------------------|-------------------------------------------------|
+| Vendor/BSP 6.1.x   | mali (blob)        | Built-in (DRM, 0.9.x) | Rockchip patches, stable but older              |
+| Mainline 6.12–6.13 | panthor            | Not yet               | panthor replaces panfrost for Valhall           |
+| Mainline 6.14–6.17 | panthor            | Experimental          | RKNPU merged but not yet stable                 |
+| **Mainline ≥6.18** | **panthor**        | **Stable**            | **Recommended — full NPU+GPU, better security** |
+| Mainline <6.12     | panfrost (limited) | No                    | Mali G610 poorly supported                      |
 
 **NPU notes:**
 
@@ -654,12 +654,12 @@ python3 scripts/rock5b/rock5b-npu-test.py --model /path/to/model.tflite  # custo
 
 **Model presets** (INT8 quantized, downloaded from Google Coral test data):
 
-| Preset | Model | Size | Description |
-|--------|-------|------|-------------|
-| `small` | MobileNet v2 | ~3.4 MB | Fast, low compute |
-| `medium` | MobileNet v1 | ~4.3 MB | Medium compute |
+| Preset                | Model            | Size    | Description                    |
+|-----------------------|------------------|---------|--------------------------------|
+| `small`               | MobileNet v2     | ~3.4 MB | Fast, low compute              |
+| `medium`              | MobileNet v1     | ~4.3 MB | Medium compute                 |
 | **`large`** (default) | SSD MobileNet v2 | ~6.5 MB | Object detection, high compute |
-| `xlarge` | Inception v4 | ~41 MB | Very high compute |
+| `xlarge`              | Inception v4     | ~41 MB  | Very high compute              |
 
 **What it does:**
 - System checks: kernel version, `/dev/accel/accel0` presence, rocket module, NPU devfreq, Teflon delegate location
