@@ -119,7 +119,7 @@ if [ -n "$EXISTING" ]; then
   for srv in "${TANG_SERVERS[@]}"; do
     [ -n "$srv" ] && DESIRED_URLS+=("$srv")
   done
-  IFS=$'\n' DESIRED_URLS_SORTED=($(printf '%s\n' "${DESIRED_URLS[@]}" | sort)); unset IFS
+  mapfile -t DESIRED_URLS_SORTED < <(printf '%s\n' "${DESIRED_URLS[@]}" | sort)
 
   if [ "${#EXISTING_URLS[@]}" -eq "${#DESIRED_URLS_SORTED[@]}" ]; then
     URLS_MATCH=true
