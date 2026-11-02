@@ -403,6 +403,26 @@ When resuming, the script automatically:
 - Locates the backup directory (or uses `--backup-dir`)
 - Skips partition-mounted checks for phases past `encrypt`
 
+**Hard failures (no silent "complete"):**
+
+The script aborts with `[FAIL]` and a non-zero exit code, keeping the backup, when:
+
+- **The target storage had errors.** After restore, bootconfig, initramfs and clevis, and again before the backup
+  may be removed, it runs `sync -f` on the mounted target, checks that the kernel has not remounted it read-only, and
+  searches the kernel log since the script started (`journalctl -k`, fallback `dmesg`) for I/O, ext4 and jbd2 errors
+  on the target device, its partitions and the LUKS/LVM nodes on top. Typical cause: a card reader or USB bridge
+  resetting mid-run (`usb ...: reset SuperSpeed USB device`). Do not boot such a card; redo the run on a reliable
+  reader connected directly to the host.
+- **`update-initramfs` fails in the chroot.** The old initramfs does not know the encrypted root, so the device
+  would end in `ALERT! /dev/pivg/root does not exist` without even asking for the passphrase.
+- **An initramfs image is incomplete or stale.** Every image on the boot partition (`initramfs*` on the RPi,
+  `initrd.img-*` on Armbian) must have changed during phase `initramfs` and must contain `cryptroot/crypttab` and
+  clevis (checked with `lsinitramfs`).
+
+Warnings that do not prevent booting (e.g. clevis binding skipped because tang was unreachable) are repeated in the
+final summary. The backup prompt defaults to keeping the backup (`[y/N]`); remove it only after the device has booted
+from the encrypted root.
+
 **Standalone SPI flash mode:**
 
 ```bash

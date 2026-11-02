@@ -156,10 +156,149 @@ YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
+WARNINGS=()
 info()  { echo -e "${CYAN}[INFO]${NC} $*"; }
-warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
+warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; WARNINGS+=("$*"); }
 ok()    { echo -e "${GREEN}[OK]${NC} $*"; }
-fail()  { echo -e "${RED}[FAIL]${NC} $*"; exit 1; }
+fail()  { echo -e "${RED}[FAIL]${NC} $*" >&2; exit 1; }
+
+# --- Target storage health ---
+# A flaky card reader / USB bridge can reset mid-run: writes are lost, ext4
+# aborts its journal and remounts read-only, and every later step (initramfs
+# rebuild, ...) fails as a consequence. These checks turn that into a hard,
+# early failure instead of a "complete" run that cannot boot.
+
+SCRIPT_START_EPOCH=$(date +%s)
+TARGET_KNAMES=""   # kernel names (sdc, sdc2, dm-7, ...) seen for the target so far
+
+# Remember the kernel names of the target device, its partitions and the
+# device-mapper nodes stacked on it (LUKS, LVM). Accumulates across calls so
+# the names are still known after LUKS/LVM were closed.
+_remember_target_knames() {
+  local name
+  [ -n "${EXT_DEVICE:-}" ] && [ -b "$EXT_DEVICE" ] || return 0
+  for name in $(lsblk -nlo KNAME "$EXT_DEVICE" 2>/dev/null); do
+    case " $TARGET_KNAMES " in
+      *" $name "*) ;;
+      *) TARGET_KNAMES="${TARGET_KNAMES:+$TARGET_KNAMES }$name" ;;
+    esac
+  done
+}
+
+# Kernel messages since this script started (dmesg ring buffer as fallback).
+_kernel_log_since_start() {
+  if command -v journalctl >/dev/null 2>&1 \
+     && journalctl -k -q --no-pager --since "@${SCRIPT_START_EPOCH}" 2>/dev/null; then
+    return 0
+  fi
+  dmesg 2>/dev/null || true
+}
+
+# Fail hard if the target storage shows any sign of trouble:
+#   - writeback errors on the mounted target filesystems (sync -f / syncfs)
+#   - a target filesystem that the kernel remounted read-only
+#   - I/O, ext4 or jbd2 errors for the target devices in the kernel log
+# Usage: _check_target_health "<context>"
+_check_target_health() {
+  local context="$1" mnt names_re hits
+  _remember_target_knames
+
+  for mnt in "${MOUNT_DST:-}" "${MOUNT_BOOT:-}"; do
+    [ -n "$mnt" ] && mountpoint -q "$mnt" 2>/dev/null || continue
+    if ! sync -f "$mnt"; then
+      fail "${context}: writeback to ${mnt} failed. The target storage reported write errors; the written data cannot be trusted."
+    fi
+    if findmnt -no OPTIONS "$mnt" 2>/dev/null | tr ',' '\n' | grep -qx ro; then
+      fail "${context}: ${mnt} is read-only now. The kernel remounted it after an error on the target storage."
+    fi
+  done
+
+  [ -n "$TARGET_KNAMES" ] || return 0
+  names_re=$(tr ' ' '|' <<<"$TARGET_KNAMES")
+  hits=$(_kernel_log_since_start \
+    | grep -E "\\b(${names_re})\\b" \
+    | grep -iE 'I/O error|EXT4-fs (error|warning)|Aborting journal|JBD2|read-only|offline|FAILED Result' \
+    || true)
+  if [ -n "$hits" ]; then
+    echo -e "${RED}[FAIL]${NC} Kernel log errors on the target storage (${TARGET_KNAMES}):" >&2
+    head -20 <<<"$hits" >&2
+    [ "$(wc -l <<<"$hits")" -gt 20 ] && echo "  ... ($(wc -l <<<"$hits") lines in total)" >&2
+    fail "${context}: the target storage had I/O errors during this run (card reader / USB reset?). Do not boot this card. Re-run on a reliable reader (directly on the host, no hub)."
+  fi
+}
+
+# --- Initramfs verification ---
+
+# Print the initramfs images on the mounted boot partition, one per line.
+_initramfs_images() {
+  [ -n "${MOUNT_BOOT:-}" ] && mountpoint -q "$MOUNT_BOOT" 2>/dev/null || return 0
+  if [ "$BOARD_TYPE" = "rpi" ]; then
+    find "$MOUNT_BOOT" -maxdepth 1 -type f -name 'initramfs*' | sort
+  else
+    find "$MOUNT_BOOT" -maxdepth 1 -type f -name 'initrd.img-*' | sort
+  fi
+}
+
+# List the contents of an initramfs image: with the host's lsinitramfs, or
+# inside the chroot (only while its /proc etc. are mounted, i.e. in phase 5).
+_list_initramfs() {
+  local img="$1" chroot_boot
+  if command -v lsinitramfs >/dev/null 2>&1; then
+    lsinitramfs "$img"
+  elif [ -n "${MOUNT_DST:-}" ] && [ -x "${MOUNT_DST}/usr/bin/lsinitramfs" ] \
+       && mountpoint -q "${MOUNT_DST}/proc" 2>/dev/null; then
+    if [ "$BOARD_TYPE" = "rpi" ]; then chroot_boot=/boot/firmware; else chroot_boot=/boot; fi
+    chroot "$MOUNT_DST" lsinitramfs "${chroot_boot}${img#"$MOUNT_BOOT"}"
+  else
+    return 2
+  fi
+}
+
+# Check every initramfs image on the boot partition: it must contain the
+# cryptsetup crypttab (otherwise the root is never unlocked and boot ends in
+# "ALERT! <root> does not exist") and clevis. With a checksum list from before
+# the rebuild ("sha256  path" lines), every image must also have changed.
+# Usage: _verify_initramfs_images ["<sha256sum output before rebuild>"]
+# Returns 1 if any image is missing, stale or incomplete.
+_verify_initramfs_images() {
+  local pre_sums="${1:-}" img name listing pre_sum bad=0
+  local images=()
+  mapfile -t images < <(_initramfs_images)
+  if [ "${#images[@]}" -eq 0 ]; then
+    warn "No initramfs image found on the boot partition"
+    return 1
+  fi
+  for img in "${images[@]}"; do
+    name=$(basename "$img")
+    if [ -n "$pre_sums" ]; then
+      pre_sum=$(awk -v p="$img" '$2 == p {print $1}' <<<"$pre_sums")
+      if [ -n "$pre_sum" ] && [ "$pre_sum" = "$(sha256sum "$img" | cut -d' ' -f1)" ]; then
+        warn "${name}: unchanged, it was NOT rebuilt in this run"
+        bad=1
+        continue
+      fi
+    fi
+    if ! listing=$(_list_initramfs "$img"); then
+      warn "${name}: cannot list its contents (no lsinitramfs on this host)"
+      bad=1
+      continue
+    fi
+    if ! grep -q 'cryptroot/crypttab' <<<"$listing"; then
+      warn "${name}: no cryptroot/crypttab inside, the root will never be unlocked at boot"
+      bad=1
+    fi
+    if ! grep -q 'clevis' <<<"$listing"; then
+      warn "${name}: no clevis inside, no tang auto-unlock"
+      bad=1
+    fi
+    if ! grep -q 'cryptroot/crypttab' <<<"$listing" || ! grep -q 'clevis' <<<"$listing"; then
+      continue
+    fi
+    ok "${name}: crypttab and clevis present ($(grep -c clevis <<<"$listing") clevis files)"
+  done
+  return "$bad"
+}
+INITRAMFS_VERIFIED=false
 
 # Cleanup function
 CLEANUP_MOUNTS=()
@@ -1096,6 +1235,7 @@ else
   fi
 fi
 
+_check_target_health "Phase 3 (restore)"
 ok "Filesystem restored"
 
 fi  # end phase gate: restore
@@ -1223,6 +1363,7 @@ if [ -f "${STAGED}/tang_check_connection.sh" ]; then
   info "Deployed tang_check_connection.sh to /root/"
 fi
 
+_check_target_health "Phase 4 (bootconfig)"
 ok "Boot configuration activated"
 
 fi  # end phase gate: bootconfig
@@ -1277,12 +1418,20 @@ if [ "$(uname -m)" != "aarch64" ]; then
   fi
 fi
 
+RESUME_HINT="sudo ./luks_encrypt.sh --start-phase=initramfs${BACKUP_DIR:+ --backup-dir=$BACKUP_DIR}"
+
+# Checksums before the rebuild, to prove afterwards that every image changed
+INITRAMFS_PRE_SUMS=$(_initramfs_images | xargs -r -d '\n' sha256sum)
+
 info "Rebuilding initramfs inside chroot..."
-chroot "$MOUNT_DST" /bin/bash -c "LC_ALL=C update-initramfs -u -k all" || {
-  warn "Initramfs rebuild in chroot failed."
-  warn "You may need to rebuild initramfs after first boot."
-  warn "(Boot with LUKS passphrase, then run: sudo update-initramfs -u -k all)"
-}
+if ! chroot "$MOUNT_DST" /bin/bash -c "LC_ALL=C update-initramfs -u -k all"; then
+  # A storage error is the more fundamental cause; report it first if present.
+  _check_target_health "Phase 5 (initramfs)"
+  fail "Initramfs rebuild in chroot failed (see the update-initramfs output above).
+       The old initramfs does not know the encrypted root: this card will NOT boot
+       (no passphrase prompt either, it ends in 'ALERT! ${ROOT_DEV} does not exist').
+       Fix the cause, then resume with: ${RESUME_HINT}"
+fi
 
 # Armbian: ensure uInitrd (U-Boot wrapped) exists
 if [ "$BOARD_TYPE" = "armbian" ]; then
@@ -1302,6 +1451,13 @@ if [ "$BOARD_TYPE" = "armbian" ]; then
   '
 fi
 
+_check_target_health "Phase 5 (initramfs)"
+info "Verifying the rebuilt initramfs images..."
+if ! _verify_initramfs_images "$INITRAMFS_PRE_SUMS"; then
+  fail "Initramfs verification failed (see warnings above): this card will NOT boot.
+       Fix the cause, then resume with: ${RESUME_HINT}"
+fi
+INITRAMFS_VERIFIED=true
 ok "Initramfs rebuilt"
 
 # Unmount chroot bind mounts (in reverse order)
@@ -1379,6 +1535,8 @@ else
   rm -f "$KEYFILE"
 fi
 
+_check_target_health "Phase 6 (clevis)"
+
 fi  # end phase gate: clevis
 
 # =====================================================================
@@ -1392,22 +1550,19 @@ info "=== Verification ==="
 info "Clevis bindings on $EXT_ROOT_PART:"
 clevis luks list -d "$EXT_ROOT_PART" 2>/dev/null || echo "  (none)"
 
-# Verify initramfs contains clevis
-if [ -n "$MOUNT_BOOT" ] && mountpoint -q "$MOUNT_BOOT" 2>/dev/null; then
-  if [ "$BOARD_TYPE" = "rpi" ]; then
-    INITRAMFS_FILE=$(find "$MOUNT_BOOT" -name 'initramfs*' -o -name 'initrd*' 2>/dev/null | head -1)
-  else
-    INITRAMFS_FILE=$(find "$MOUNT_BOOT" -name 'initrd.img-*' 2>/dev/null | head -1)
-  fi
-  if [ -n "$INITRAMFS_FILE" ]; then
-    CLEVIS_COUNT=$(lsinitramfs "$INITRAMFS_FILE" 2>/dev/null | grep -c clevis || echo "0")
-    info "Clevis hooks in initramfs: $CLEVIS_COUNT files"
-  else
-    info "Could not locate initramfs file for verification"
+# Verify every initramfs image can unlock the encrypted root
+if [ "$INITRAMFS_VERIFIED" = true ]; then
+  info "Initramfs images already verified in phase 5"
+elif [ -n "$MOUNT_BOOT" ] && mountpoint -q "$MOUNT_BOOT" 2>/dev/null; then
+  if ! _verify_initramfs_images; then
+    fail "Initramfs verification failed (see warnings above): this card will NOT boot.
+       Rebuild it with: sudo ./luks_encrypt.sh --start-phase=initramfs${BACKUP_DIR:+ --backup-dir=$BACKUP_DIR}"
   fi
 else
-  info "Boot partition not mounted — skipping initramfs verification"
+  fail "Boot partition not mounted, cannot verify the initramfs images."
 fi
+
+_check_target_health "Verification"
 
 # Clean unmount
 info "Unmounting..."
@@ -1545,9 +1700,12 @@ fi
 
 # Remove backup (only if a backup was created or found)
 if [ -n "$BACKUP_DIR" ] && [ -d "$BACKUP_DIR" ]; then
+  # Last line of defence: never drop the backup after storage errors
+  _check_target_health "Before removing the backup"
   echo ""
-  read -rp "Remove backup directory $BACKUP_DIR? [Y/n] " RM_BACKUP
-  if [[ "$RM_BACKUP" != [nN] ]]; then
+  info "Keep the backup until the device has booted from the encrypted root."
+  read -rp "Remove backup directory $BACKUP_DIR now? [y/N] " RM_BACKUP
+  if [[ "$RM_BACKUP" == [yY] ]]; then
     rm -rf "$BACKUP_DIR"
     BACKUP_DIR_FOR_CLEANUP=""
     ok "Backup removed"
@@ -1559,7 +1717,14 @@ fi
 
 echo ""
 echo "================================================================="
-echo -e "${GREEN}Encryption complete!${NC}"
+if [ "${#WARNINGS[@]}" -eq 0 ]; then
+  echo -e "${GREEN}Encryption complete!${NC}"
+else
+  echo -e "${YELLOW}Encryption complete, with ${#WARNINGS[@]} warning(s):${NC}"
+  for _w in "${WARNINGS[@]}"; do
+    echo -e "  ${YELLOW}-${NC} ${_w}"
+  done
+fi
 echo "================================================================="
 echo ""
 
