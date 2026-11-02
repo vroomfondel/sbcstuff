@@ -1,4 +1,4 @@
-.PHONY: tests help install venv lint isort tcheck build commit-checks prepare gitleaks pypibuild pypipush docker update-all-dockerhub-readmes teflon-fetch teflon-release
+.PHONY: tests help install venv lint isort tcheck shellcheck build commit-checks prepare gitleaks pypibuild pypipush docker update-all-dockerhub-readmes teflon-fetch teflon-release
 SHELL := /usr/bin/bash
 .ONESHELL:
 
@@ -8,6 +8,7 @@ help:
 	@printf "\nisort\n\tmake isort import corrections\n"
 	@printf "\nlint\n\tmake linter check with black\n"
 	@printf "\ntcheck\n\tmake static type checks with mypy\n"
+	@printf "\nshellcheck\n\tlint scripts/luks/*.sh with shellcheck -S warning (installs shellcheck-py into the venv)\n"
 	@printf "\nprepare\n\tLaunch tests and commit-checks\n"
 	@printf "\ncommit-checks\n\trun pre-commit checks on all files\n"
 	@printf "\nteflon-fetch\n\tFetch libteflon.so build artifacts from Rock 5B\n"
@@ -48,6 +49,11 @@ isort: venv
 tcheck: venv
 	@$(venv_activated)
 	mypy .
+
+shellcheck: venv
+	@$(venv_activated)
+	if ! command -v shellcheck >/dev/null 2>&1 ; then pip install shellcheck-py ; fi
+	shellcheck -S warning scripts/luks/*.sh scripts/luks/tests/*.sh
 
 gitleaks: venv .git/hooks/pre-commit
 	@$(venv_activated)
