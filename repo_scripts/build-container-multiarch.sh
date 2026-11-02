@@ -212,13 +212,13 @@ copy_image_from_remote() {
     local -a pv_args=(-ptebar)
     [[ -n "${size}" ]] && pv_args+=(-s "${size}")
     set -o pipefail
-    podman --connection "${connection}" image save "${image}" \
+    podman --connection "${connection}" image save --format oci-archive "${image}" \
       | pv "${pv_args[@]}" \
       | podman image load \
       || die "streamed image transfer of ${image} failed"
   else
     set -o pipefail
-    podman --connection "${connection}" image save "${image}" \
+    podman --connection "${connection}" image save --format oci-archive "${image}" \
       | podman image load \
       || die "streamed image transfer of ${image} failed"
   fi

@@ -34,7 +34,10 @@ classifiers = [
     "Operating System :: POSIX :: Linux",
 ]
 
-[tool.hatch.build.targets.wheel]
+# File selection for ALL build targets, not just the wheel. A `packages` key under
+# [tool.hatch.build.targets.wheel] scopes the wheel alone and leaves the sdist on
+# hatchling's default, which ships the whole project root minus .gitignore.
+[tool.hatch.build]
 packages = ["scripts"]
 
 [tool.black]
