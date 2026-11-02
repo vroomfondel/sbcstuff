@@ -260,23 +260,44 @@ _prompt_tang_servers() {
 # =====================================================================
 
 # 6. Install packages
+# Run an apt-get command (in the target) with retries: a transient DNS or mirror failure ("Temporary
+# failure resolving 'deb.debian.org'") must not abort the run. Before each retry the resolver is probed.
+# Usage: _apt_retry <apt-get arguments...>
+_apt_retry() {
+  local attempt tries=4 pause=15
+  for attempt in $(seq 1 "$tries"); do
+    if _in_target "${APT_ENV[@]}" apt-get "$@"; then
+      return 0
+    fi
+    if [ "$attempt" -lt "$tries" ]; then
+      warn "apt-get $1 failed (attempt ${attempt}/${tries}), retrying in ${pause}s..."
+      sleep "$pause"
+      if ! _in_target getent hosts deb.debian.org >/dev/null 2>&1; then
+        warn "  DNS inside the target does not resolve deb.debian.org (resolv.conf: $(grep -v '^#' "${TARGET_ROOT}/etc/resolv.conf" 2>/dev/null | tr '\n' ' '))"
+      fi
+    fi
+  done
+  return 1
+}
+
 install_packages() {
   info "Installing required packages..."
-  local apt_env=()
+  APT_ENV=()
   if [ -n "$TARGET_ROOT" ]; then
-    apt_env=(env DEBIAN_FRONTEND=noninteractive)
+    APT_ENV=(env DEBIAN_FRONTEND=noninteractive)
   fi
-  _in_target "${apt_env[@]}" apt-get update -qq
+  _apt_retry update -qq || fail "apt-get update failed repeatedly (network or DNS problem on this host?)"
 
   LVM_PKGS=""
   if [ "$USE_LVM" = true ]; then
     LVM_PKGS="lvm2"
   fi
 
-  _in_target "${apt_env[@]}" apt-get install -y \
+  # shellcheck disable=SC2086
+  _apt_retry install -y \
     cryptsetup cryptsetup-initramfs \
     clevis clevis-luks clevis-initramfs clevis-systemd \
-    curl jq $LVM_PKGS
+    curl jq $LVM_PKGS || fail "apt-get install failed repeatedly (network or DNS problem on this host?)"
   ok "Packages installed"
 }
 
@@ -1136,6 +1157,8 @@ QEMU_COPIED=false
 BINFMT_INTERP=""
 OLD_DISK_ID=""
 NEW_DISK_ID=""
+CUR_DISK_ID=""                  # Disk ID found in the preflight
+PARTITION_DONE=false            # Partition 2 already grown by an unfinished earlier run (resume)
 SCRIPT_START_EPOCH=$(date +%s)
 TARGET_KNAMES=""                # Kernel names (sdc, sdc2, ...) of the card, for the kernel log check
 
@@ -1281,10 +1304,18 @@ _offline_check_device() {
   size=$(cat "/sys/class/block/$(basename "$OFFLINE_P2")/size")
   total=$(cat "/sys/class/block/${name}/size")
   free=$((total - start - size))
+  CUR_DISK_ID=$(sfdisk --disk-id "$dev" 2>/dev/null || true)
+  CUR_DISK_ID="${CUR_DISK_ID#0x}"
+  CUR_DISK_ID="${CUR_DISK_ID,,}"
   if [ "$free" -lt "$MIN_FREE_AFTER_P2_SECTORS" ]; then
-    fail "Partition 2 already reaches the end of the card (only $((free / 2048)) MiB free behind it): it was grown by a first boot already, or the card is not larger than the image"
+    # Either a first boot grew it (refused by the image checks: machine-id, SSH keys, ' resize'),
+    # or an earlier offline run failed after its partition phase. The image checks decide.
+    PARTITION_DONE=true
+    info "  Partition 2 already reaches the end of the card ($((free / 2048)) MiB free behind it, disk ID 0x${CUR_DISK_ID})"
+    info "  Resuming after the partition phase if the image checks confirm an unfinished offline run"
+  else
+    info "  $((free / 2048)) MiB free behind partition 2 (not grown yet)"
   fi
-  info "  $((free / 2048)) MiB free behind partition 2 (not grown yet)"
 
   info "  Checking the root filesystem of $OFFLINE_P2 (read-only fsck)..."
   local fsck_out
@@ -1313,7 +1344,26 @@ _image_checks() {
       soft_fail "cmdline.txt uses init=/usr/lib/raspberrypi-sys-mods/firstboot: this is a Bookworm style image, the first-boot mechanism differs and is not supported"
       bad=1
     fi
-    if [ "$mode" = "pre" ]; then
+    if [ "$mode" = "pre" ] && [ "$PARTITION_DONE" = true ]; then
+      # Resume of an unfinished offline run: our partition phase removed ' resize' and wrote the
+      # current disk ID into cmdline.txt and fstab. Anything else means a foreign or booted card.
+      if [[ " $cmdline " == *" resize "* ]]; then
+        soft_fail "partition 2 is grown but cmdline.txt still has ' resize': the card was grown outside this script (first boot or another tool)"
+        bad=1
+      fi
+      if ! grep -qiE "PARTUUID=${CUR_DISK_ID}-02" <<<"$cmdline"; then
+        soft_fail "partition 2 is grown but cmdline.txt does not reference the disk ID 0x${CUR_DISK_ID} of the card: not an unfinished run of this script"
+        bad=1
+      fi
+      if ! grep -qiE "PARTUUID=${CUR_DISK_ID}-0[12]" "$root/etc/fstab" 2>/dev/null; then
+        soft_fail "partition 2 is grown but fstab does not reference the disk ID 0x${CUR_DISK_ID} of the card"
+        bad=1
+      fi
+      if [ -e "$root/root/luks-staged/luks.conf" ]; then
+        soft_fail "/root/luks-staged/luks.conf exists: the earlier run got past the configure phase, write the image again instead of resuming"
+        bad=1
+      fi
+    elif [ "$mode" = "pre" ]; then
       if [[ " $cmdline " != *" resize "* ]]; then
         soft_fail "cmdline.txt has no ' resize' parameter: the image was booted already or is not a stock Raspberry Pi OS image"
         bad=1
@@ -1333,7 +1383,7 @@ _image_checks() {
         soft_fail "cmdline.txt does not reference the new disk ID (PARTUUID=${NEW_DISK_ID}-02)"
         bad=1
       fi
-      if grep -qi "PARTUUID=${OLD_DISK_ID}" "$cmdfile" "$root/etc/fstab"; then
+      if [ -n "$OLD_DISK_ID" ] && grep -qi "PARTUUID=${OLD_DISK_ID}" "$cmdfile" "$root/etc/fstab"; then
         soft_fail "The old disk ID ${OLD_DISK_ID} is still referenced in cmdline.txt or fstab"
         bad=1
       fi
@@ -1435,6 +1485,13 @@ _offline_partition() {
   echo ""
   info "Phase: partition (grow partition 2, new disk ID)"
   local dev="$OFFLINE_DEVICE" ss bytes total end cur_end got
+
+  if [ "$PARTITION_DONE" = true ]; then
+    OLD_DISK_ID=""
+    NEW_DISK_ID="$CUR_DISK_ID"
+    ok "Partition phase skipped: partition 2 is grown and the card already has the disk ID 0x${NEW_DISK_ID} (resumed run)"
+    return 0
+  fi
 
   OLD_DISK_ID=$(sfdisk --disk-id "$dev")
   OLD_DISK_ID="${OLD_DISK_ID#0x}"
@@ -1558,6 +1615,15 @@ _offline_rewrite_bootconfig() {
   local n_fstab n_cmd ds_before ds_after
 
   [ -f "$fst" ] || fail "No /etc/fstab on the card"
+  if [ "$PARTITION_DONE" = true ]; then
+    # Already rewritten by the earlier run (verified by the image checks); just show the result
+    [[ " $(cat "$cmd") " != *" resize "* ]] || fail "' resize' is still in cmdline.txt (resumed run)"
+    grep -qiE "PARTUUID=${NEW_DISK_ID}-02" "$cmd" || fail "cmdline.txt does not reference PARTUUID=${NEW_DISK_ID}-02 (resumed run)"
+    grep -q 'ds=nocloud;i=' "$cmd" || fail "cmdline.txt lost the cloud-init parameter 'ds=nocloud;i=' (resumed run)"
+    info "  cmdline.txt: $(cat "$cmd")"
+    ok "fstab and cmdline.txt were rewritten by the earlier run, kept"
+    return 0
+  fi
   n_fstab=$(grep -ciE "PARTUUID=${OLD_DISK_ID}-0[12]" "$fst" || true)
   n_cmd=$(grep -ciE "PARTUUID=${OLD_DISK_ID}-0[12]" "$cmd" || true)
   [ "$n_fstab" -gt 0 ] || warn "fstab does not reference PARTUUID=${OLD_DISK_ID}-0x"
