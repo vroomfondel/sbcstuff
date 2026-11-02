@@ -124,6 +124,104 @@ Alternative: split the boot partition on an external machine without rebooting t
 7. Run `sudo ./luks_encrypt.sh` against the eMMC
 8. Remove SD card and boot from encrypted eMMC
 
+### Offline mode (never-booted card)
+
+Use this when a fresh Raspberry Pi OS (Trixie) card, written with Raspberry Pi Imager 2.x including the cloud-init customisation (user, hostname, SSH keys, Wi-Fi), should be encrypted on the workstation **before the Pi has ever booted it**. It replaces the first boot of the normal Raspberry Pi flow: no SSH access is needed before encryption, and the cloud-init secrets never land on an unencrypted root. Typical cases: several demo Pis from one image, cards prepared in advance. Armbian, NVMe/USB targets and Bookworm images are not supported. The design is in [LUKS_OFFLINE_PLAN.md](LUKS_OFFLINE_PLAN.md).
+
+```bash
+sudo ./luks_prepare.sh --offline=/dev/sdX --board=pi5
+sudo ./luks_encrypt.sh --device=/dev/sdX
+# card into the Pi, cable connected: tang unlock, then the normal first boot (cloud-init etc.)
+```
+
+Non-interactive variant (no prompts at all; without a terminal on stdin and without these options both scripts fail instead of prompting):
+
+```bash
+sudo ./luks_prepare.sh --offline=/dev/sdX --board=pi5 --yes --tang=http://a,http://b
+sudo ./luks_encrypt.sh --device=/dev/sdX --yes --passphrase-file=/path/to/pass --tang=http://a,http://b --keep-backup
+```
+
+`luks_prepare.sh --offline` works in a chroot on the card (qemu-user-static on a non-aarch64 host): it grows partition 2 to the end of the card, assigns a new random disk ID, removes ` resize` from `cmdline.txt`, installs the packages and configures the initramfs. It then restores the first-boot state and stages the files for `luks_encrypt.sh`.
+
+**Preflight conditions** (the script refuses instead of guessing, before it changes anything):
+
+- Host: root; `parted`, `sfdisk`, `e2fsck`, `cryptsetup`, `clevis`, `jq`, `curl`, `lsinitramfs`, `findmnt`; an aarch64 host, or a `binfmt_misc` entry for aarch64 with flag `F`
+- Device: block device, removable or USB/MMC, not mounted, not part of the running system, exactly two partitions (p1 vfat `bootfs`, p2 ext4 `rootfs`)
+- Image, all of:
+  - `cmdline.txt` contains ` resize` and `ds=nocloud;i=`, and not `init=/usr/lib/raspberrypi-sys-mods/firstboot` (Bookworm marker)
+  - `/etc/machine-id` contains exactly `uninitialized`
+  - no `/etc/ssh/ssh_host_*` keys and no `/var/lib/cloud/instance`
+  - `user-data` and `meta-data` exist on p1
+  - partition 2 ends well before the end of the card (not yet grown)
+
+**Network driver (`--board`).** There is no running system to detect the Ethernet driver from, so `--board` selects the module for the initramfs. `--iface=<name>` overrides the interface name (default `eth0`). Wi-Fi in the initramfs stays unsupported (tang unlock needs Ethernet); the follow-up is in [LUKS_OFFLINE_PLAN.md](LUKS_OFFLINE_PLAN.md), section 8.1.
+
+| `--board`  | Ethernet driver  | Note                                       |
+|------------|------------------|--------------------------------------------|
+| `pi5`      | `macb`           | verified on kikube-rpi5-demo1 (2026-11-02) |
+| `pi4`      | `bcmgenet`       | to verify on hardware                      |
+| `pi3bplus` | `lan78xx`        | USB Ethernet, to verify                    |
+| `pi3b`     | `smsc95xx`       | USB Ethernet, to verify                    |
+| `all`      | all of the above | larger initramfs, one card for every model |
+
+#### USB key stick (optional)
+
+Besides tang and the typed passphrase, the root can be unlocked by a USB stick that carries a key file. The initramfs scripts are identical to the keyfile fallback of the Ansible clevis role used for the cluster hosts (file names `clevis-keyfile`; keep both copies in sync), so one stick can carry the keys of Raspberry Pis and cluster hosts alike. Both scripts have an option for it:
+
+- `luks_prepare.sh --usb-key [--usb-key-host=<name>]` (online and offline) installs `etc/initramfs-tools/hooks/clevis-keyfile`, `scripts/local-top/clevis-keyfile`, `scripts/local-bottom/clevis-keyfile` and `etc/clevis-keyfile/keyfile.conf` (`USB=1`, `USB_LABEL='LUKSKEY'`, `USB_FILE='luks-fallback.key'`, `USB_DIR='luks-keys'`, `HOST='<host>'`, `BOOT=0`) and writes `USB_KEY="yes"`, `USB_KEY_LABEL="LUKSKEY"` and `USB_KEY_HOST="<host>"` to `luks.conf`. `<host>` is the hostname (offline: from `user-data`) unless `--usb-key-host` is given.
+- `luks_encrypt.sh --usb-key-file=<path>` adds the first line of that file as a third LUKS keyslot (passphrase, clevis, USB key). A file that does not exist is generated (64 base64 characters, one line, mode 600). If the path is a directory, such as the mounted stick, the key is placed at `<dir>/luks-keys/<host>.key` (`<host>` from `USB_KEY_HOST` in `luks.conf`; `luks-keys/` is created, the filesystem label is checked against `LUKSKEY`), so nothing has to be copied afterwards. The script verifies the keyslot count, a `cryptsetup open --test-passphrase` with the key, and that every initramfs contains `scripts/local-top/clevis-keyfile`. If `luks.conf` has `USB_KEY="yes"` and the option is missing, the script fails early. The master copy of the key is `/etc/clevis-keyfile/fallback.key` on the encrypted root (mode 600, 64 base64 characters, no trailing newline); the key is never part of an initramfs. `/root/clevis_keyfile_write_usb.sh <partition>` on the root copies it to a stick and verifies it with `--test-passphrase`.
+
+```bash
+sudo ./luks_prepare.sh --offline=/dev/sdX --board=pi5 --usb-key
+sudo ./luks_encrypt.sh --device=/dev/sdX --usb-key-file=/safe/place/pi5-demo1.key   # generated if missing
+sudo ./luks_encrypt.sh --device=/dev/sdX --usb-key-file=/media/$USER/LUKSKEY         # mounted stick: luks-keys/<host>.key
+```
+
+**Prepare the stick.** One partition (vfat, exfat or ext4) labelled exactly `LUKSKEY`, with the key in `luks-keys/<hostname>.key`. The file must contain the key exactly, without a trailing newline:
+
+```bash
+sudo mkfs.vfat -n LUKSKEY /dev/sdY1          # /dev/sdY1 is the partition on the stick, double-check it with lsblk
+sudo mount /dev/sdY1 /mnt
+sudo mkdir -p /mnt/luks-keys
+sudo sh -c 'printf "%s" "$(head -n1 /safe/place/pi5-demo1.key)" > /mnt/luks-keys/<hostname>.key'
+sudo umount /mnt
+```
+
+After the first boot, `sudo /root/clevis_keyfile_write_usb.sh /dev/sdY1` on the Pi does the same from the master copy and checks that the key unlocks the card. A single file `luks-fallback.key` in the root of the stick (old layout) is tried as well. Keys of other hosts on the same stick are left alone.
+
+**How it works at boot.** `local-top/clevis-keyfile` runs in the background in the initramfs, waits for cryptroot's `askpass` and writes the key into its passphrase FIFO, like the clevis initramfs script does for the tang key. It searches the stick (by label `LUKSKEY`, mounted read-only) for the own `luks-keys/<host>.key` first, then for every other `*.key`. Each key is checked with `cryptsetup open --test-passphrase` before it is written, and a rejected key is not retried for the same prompt, so a stale stick never uses up one of cryptroot's tries. Tang, the stick and a typed passphrase all answer the same prompt; the first valid answer wins, and the stick may be plugged in while the prompt is shown. `local-bottom/clevis-keyfile` stops the loop and unmounts the stick.
+
+**Security note.** The key on the stick is plain text: whoever holds the stick and the card can unlock the system. Keep the stick separate from the Pi and do not leave it plugged in. The label is fixed to `LUKSKEY`, and the watcher does not detect removal of the stick.
+
+**First boot on the Pi (expected).**
+
+1. The firmware loads the initramfs, which brings up `eth0` per DHCP; clevis unlocks via both tang servers.
+2. LVM activates `pivg/root` and the root is mounted. There is no `resize_early`, because the ` resize` parameter is gone.
+3. systemd sees `machine-id` = `uninitialized` and runs the first-boot logic: `rpi-resize` and `systemd-growfs-root` run (a no-op, the filesystem already fills the volume), `regenerate_ssh_host_keys` creates the SSH host keys.
+4. cloud-init applies `user-data` and `network-config` from `/boot/firmware` (user, hostname, SSH keys, ssh enabled).
+
+Checks after the first boot:
+
+```bash
+cloud-init status --long            # status: done, no errors
+cat /etc/machine-id                 # a real ID now
+ls /etc/ssh/ssh_host_*              # keys exist
+lsblk; lvs                          # mmcblk0p2 over the whole card, pivg/root full size
+grep -c ' resize' /proc/cmdline     # 0
+clevis luks list -d /dev/mmcblk0p2  # sss binding
+/root/tang_check_connection.sh /dev/mmcblk0p2
+cryptsetup luksDump /dev/mmcblk0p2 | grep -cE '^\s+[0-9]+: luks2$'   # keyslots: 2, or 3 with --usb-key
+```
+
+**Testing without hardware.** `scripts/luks/tests/offline_loop_test.sh` runs the whole offline flow on an image file attached as loop device (needs root, test only, never touches a real card): it decompresses the Imager download, simulates a 16G card, writes the cloud-init seed, runs both scripts non-interactively (`--allow-loop --yes --tang=...`, for encrypt also `--passphrase-file`, `--keep-backup` and `--backup-dir`, stdin from `/dev/null`, so a forgotten prompt fails instead of hanging), checks the result (partition end, disk ID, first-boot state, initramfs contents, keyslots) and runs three negative cases (booted image, Bookworm image, missing `user-data`). `--help` lists the options, `--dry-run` checks tools and image without root. With `--usb-key` the run also covers the USB key stick option: `luks_prepare.sh --usb-key`, `luks_encrypt.sh --usb-key-file=<work>/usbkey`, then it checks the generated key file (64 characters, mode 600), three keyslots instead of two, `scripts/local-top/clevis-keyfile`, `scripts/local-bottom/clevis-keyfile` and `etc/clevis-keyfile/keyfile.conf` in every initramfs (and none of them without `--usb-key`; `etc/clevis-keyfile/fallback.key` never), `USB_KEY="yes"`, `USB_KEY_LABEL="LUKSKEY"` and `USB_KEY_HOST` in `luks.conf`, `USB=1` and `HOST=` in `keyfile.conf`, the master key `/etc/clevis-keyfile/fallback.key` on the opened root, `/root/clevis_keyfile_write_usb.sh`, and `cryptsetup open --test-passphrase` with the key. The initramfs scripts themselves need the initramfs environment and a real stick and are a hardware test.
+
+```bash
+sudo scripts/luks/tests/offline_loop_test.sh --tang=http://tang1.example.com,http://tang2.example.com
+sudo scripts/luks/tests/offline_loop_test.sh --negative
+```
+
+`make shellcheck` lints `scripts/luks/*.sh` and `scripts/luks/tests/*.sh` with `shellcheck -S warning` (installs `shellcheck-py` into the venv if `shellcheck` is missing); the same check runs as a pre-commit hook.
+
 ### Configuration Variables
 
 Both scripts share the same configuration block at the top. **Values must match between the two scripts.**
@@ -147,7 +245,22 @@ Runs **on the target board** as root. Prepares the system for encryption.
 ```bash
 sudo ./luks_prepare.sh      # interactive — detects board and presents scenario menu
 sudo ./luks_prepare.sh -h   # show help
+sudo ./luks_prepare.sh --offline=/dev/sdX --board=pi5   # never-booted card in this machine (see "Offline mode")
+sudo ./luks_prepare.sh --offline=/dev/sdX --board=pi5 --yes --tang=http://a,http://b   # non-interactive
 ```
+
+**Offline options** (Raspberry Pi only; with `--offline` the script runs on the workstation against the card instead of on the board, board and storage detection are replaced by the arguments):
+
+| Option                  | Description                                                                                                                                                                                                                                                     |
+|-------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `--offline=<dev>`       | Prepare the never-booted card `<dev>` in a chroot. Refuses images that do not pass the preflight checks.                                                                                                                                                        |
+| `--board=<model>`       | Network driver for the initramfs: `pi5`, `pi4`, `pi3bplus`, `pi3b` or `all`. Required with `--offline`.                                                                                                                                                         |
+| `--iface=<name>`        | Interface name for the initramfs networking (default `eth0`).                                                                                                                                                                                                   |
+| `--allow-loop`          | Accept a loop device as `<dev>`. For tests only (`scripts/luks/tests/offline_loop_test.sh`), never for real cards.                                                                                                                                              |
+| `--yes`                 | Skip every confirmation prompt (non-interactive). Without it and without a terminal on stdin the script fails instead of prompting.                                                                                                                             |
+| `--tang=<url1>,<url2>`  | Tang servers on the command line; overrides the script variable and `luks.conf`.                                                                                                                                                                                |
+| `--usb-key`             | Also install the USB key stick unlock (`clevis-keyfile` initramfs hook and scripts, `etc/clevis-keyfile/keyfile.conf`, `USB_KEY="yes"`, `USB_KEY_LABEL="LUKSKEY"` and `USB_KEY_HOST` in `luks.conf`). Works online and offline; see "USB key stick (optional)". |
+| `--usb-key-host=<name>` | Host name for the key file on the stick (`luks-keys/<name>.key`). Default: the hostname (offline: from `user-data`). Only with `--usb-key`.                                                                                                                     |
 
 **What it does:**
 
@@ -339,6 +452,8 @@ Runs on an **external machine** (RPi), or **locally on the same board** (Armbian
 ```bash
 sudo ./luks_encrypt.sh                                          # full run
 sudo ./luks_encrypt.sh --lv-size=50G                            # set root LV size (default: 100%FREE)
+sudo ./luks_encrypt.sh --device=/dev/sdX                        # skip the device prompt (still asks for the final confirmation)
+sudo ./luks_encrypt.sh --device=/dev/sdX --yes --passphrase-file=/path/to/pass --tang=http://a,http://b --keep-backup  # non-interactive
 sudo ./luks_encrypt.sh --spi-only                               # flash U-Boot to SPI only (skip encryption)
 sudo ./luks_encrypt.sh --start-phase=clevis                     # resume from clevis binding phase
 sudo ./luks_encrypt.sh --start-phase=restore --backup-dir=/tmp/luks-backup.abc123  # resume restore with explicit backup
@@ -348,14 +463,22 @@ sudo ./luks_encrypt.sh -h                                       # show help
 
 **CLI flags:**
 
-| Flag                        | Description                                                                                                                       |
-|-----------------------------|-----------------------------------------------------------------------------------------------------------------------------------|
-| `--start-phase=<name\|num>` | Resume from a specific phase (by name or number 1-8). Auto-sets up prerequisites (opens LUKS, mounts partitions, locates backup). |
-| `--backup-dir=<path>`       | Specify backup directory explicitly (required when resuming if multiple backups exist).                                           |
-| `--lv-size=<size>`          | Set root LV size instead of 100%FREE (e.g., `50G`, `50%FREE`). Only applies when `USE_LVM=true`.                                  |
-| `--list-phases`             | Print all phases with descriptions and exit.                                                                                      |
-| `--spi-only`                | Skip all encryption, run only the SPI U-Boot flash for RK3588 NVMe/USB boot.                                                      |
-| `-h`, `--help`              | Show help and exit.                                                                                                               |
+| Flag                       | Description                                                                                                                                                                                                                                                                                                                                                                                                            |                                                                                                                                   |
+|----------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------|
+| `--start-phase=<name\      | num>`                                                                                                                                                                                                                                                                                                                                                                                                                  | Resume from a specific phase (by name or number 1-8). Auto-sets up prerequisites (opens LUKS, mounts partitions, locates backup). |
+| `--backup-dir=<path>`      | Specify backup directory explicitly (required when resuming if multiple backups exist).                                                                                                                                                                                                                                                                                                                                |                                                                                                                                   |
+| `--lv-size=<size>`         | Set root LV size instead of 100%FREE (e.g., `50G`, `50%FREE`). Only applies when `USE_LVM=true`.                                                                                                                                                                                                                                                                                                                       |                                                                                                                                   |
+| `--device=<dev>`           | Select the target device non-interactively (skips the device prompt; the `lsblk` overview stays, the final confirmation too unless `--yes` is given). Use with `luks_prepare.sh --offline`; also works for the online Raspberry Pi flow.                                                                                                                                                                               |                                                                                                                                   |
+| `--allow-loop`             | Accept a loop device as `--device`. For tests only (`scripts/luks/tests/offline_loop_test.sh`), never for real cards.                                                                                                                                                                                                                                                                                                  |                                                                                                                                   |
+| `--yes`                    | Skip every confirmation prompt (non-interactive). Without it and without a terminal on stdin the script fails instead of prompting.                                                                                                                                                                                                                                                                                    |                                                                                                                                   |
+| `--tang=<url1>,<url2>`     | Tang servers on the command line; overrides the script variable and `luks.conf`.                                                                                                                                                                                                                                                                                                                                       |                                                                                                                                   |
+| `--usb-key-file=<path>`    | Add the first line of the file as a third LUKS keyslot (USB key stick unlock). A missing file is generated (64 base64 characters, one line, mode 600); a directory (the mounted stick) means `<dir>/luks-keys/<host>.key`. Verifies the keyslot count, a `--test-passphrase` open and `scripts/local-top/clevis-keyfile` in every initramfs. Fails early if `luks.conf` has `USB_KEY="yes"` and the option is missing. |                                                                                                                                   |
+| `--passphrase-file=<path>` | Read the LUKS passphrase from the first line of the file (no ownership or mode requirements) instead of prompting.                                                                                                                                                                                                                                                                                                     |                                                                                                                                   |
+| `--keep-backup`            | Keep the backup directory after a successful run without asking.                                                                                                                                                                                                                                                                                                                                                       |                                                                                                                                   |
+| `--remove-backup`          | Remove the backup directory after a successful run without asking.                                                                                                                                                                                                                                                                                                                                                     |                                                                                                                                   |
+| `--list-phases`            | Print all phases with descriptions and exit.                                                                                                                                                                                                                                                                                                                                                                           |                                                                                                                                   |
+| `--spi-only`               | Skip all encryption, run only the SPI U-Boot flash for RK3588 NVMe/USB boot.                                                                                                                                                                                                                                                                                                                                           |                                                                                                                                   |
+| `-h`, `--help`             | Show help and exit.                                                                                                                                                                                                                                                                                                                                                                                                    |                                                                                                                                   |
 
 **Modes:**
 
@@ -373,16 +496,16 @@ sudo ./luks_encrypt.sh -h                                       # show help
 
 The script is organized into 8 resumable phases. Each phase is gated — when using `--start-phase`, earlier phases are skipped and prerequisites (LUKS open, mounts, backup directory) are automatically set up.
 
-| # | Phase        | Description                                                                                                                                                                          |
-|---|--------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| 1 | `detect`     | Device detection, board type, confirmation                                                                                                                                           |
-| 2 | `backup`     | Root partition backup via rsync (skipped for NVMe/USB migration — data is copied directly in restore phase)                                                                          |
-| 3 | `encrypt`    | Stale device cleanup, `wipefs`, LUKS2 format + open with user-provided passphrase                                                                                                    |
-| 4 | `restore`    | Create filesystem (+ LVM if enabled), rsync restore, file count verification                                                                                                         |
-| 5 | `bootconfig` | Board-specific boot config: RPi (`cmdline.txt` + `config.txt`), Armbian (`armbianEnv.txt`), both (`/etc/crypttab`, `/etc/fstab`, `cleanup-netplan` hook, `tang_check_connection.sh`) |
-| 6 | `initramfs`  | Chroot + `update-initramfs`; Armbian also ensures `uInitrd` (U-Boot wrapped) via `mkimage`                                                                                           |
-| 7 | `clevis`     | Clevis/Tang SSS binding (prompts for LUKS passphrase if not already available)                                                                                                       |
-| 8 | `verify`     | Verification (clevis bindings, initramfs hooks), cleanup, SPI U-Boot flash (RK3588 NVMe/USB migration)                                                                               |
+| #   | Phase        | Description                                                                                                                                                                          |
+|-----|--------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| 1   | `detect`     | Device detection, board type, confirmation                                                                                                                                           |
+| 2   | `backup`     | Root partition backup via rsync (skipped for NVMe/USB migration — data is copied directly in restore phase)                                                                          |
+| 3   | `encrypt`    | Stale device cleanup, `wipefs`, LUKS2 format + open with user-provided passphrase                                                                                                    |
+| 4   | `restore`    | Create filesystem (+ LVM if enabled), rsync restore, file count verification                                                                                                         |
+| 5   | `bootconfig` | Board-specific boot config: RPi (`cmdline.txt` + `config.txt`), Armbian (`armbianEnv.txt`), both (`/etc/crypttab`, `/etc/fstab`, `cleanup-netplan` hook, `tang_check_connection.sh`) |
+| 6   | `initramfs`  | Chroot + `update-initramfs`; Armbian also ensures `uInitrd` (U-Boot wrapped) via `mkimage`                                                                                           |
+| 7   | `clevis`     | Clevis/Tang SSS binding (prompts for LUKS passphrase if not already available)                                                                                                       |
+| 8   | `verify`     | Verification (clevis bindings, initramfs hooks), cleanup, SPI U-Boot flash (RK3588 NVMe/USB migration)                                                                               |
 
 **Resuming after failure:**
 
@@ -501,6 +624,9 @@ lvs
 # Show clevis/tang SSS binding
 clevis luks list -d /dev/mmcblk0p2    # RPi SD
 clevis luks list -d /dev/nvme0n1p2    # NVMe
+
+# Count the LUKS2 keyslots: 2 (passphrase, clevis), 3 with the USB key stick (luks_prepare.sh --usb-key)
+cryptsetup luksDump /dev/mmcblk0p2 | grep -cE '^\s+[0-9]+: luks2$'
 
 # Test tang connectivity and decryption
 sudo /root/tang_check_connection.sh /dev/<partition>
