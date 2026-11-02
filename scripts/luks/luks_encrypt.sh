@@ -5,17 +5,24 @@
 #   - Raspberry Pi: runs on EXTERNAL machine with Pi's SD/NVMe plugged in
 #   - Armbian NVMe/USB migration: runs LOCALLY on the same board (target != boot disk)
 #   - Armbian in-place: runs from SD card against eMMC
+#   - Raspberry Pi OS card prepared offline (scenario rpi_offline): the card was
+#     never booted, luks_prepare.sh --offline staged everything on it
 #
 # Prerequisites:
 #   - luks_prepare.sh has been run first
 #   - cryptsetup, clevis, clevis-luks, curl, jq, rsync installed
 #
 # Usage: sudo ./luks_encrypt.sh
+#        sudo ./luks_encrypt.sh --device=/dev/sdX   # Skip the device prompt (confirmation stays)
 #        sudo ./luks_encrypt.sh --lv-size=50G   # Set root LV size (default: 100%FREE)
 #        sudo ./luks_encrypt.sh --spi-only       # Flash U-Boot to SPI only (skip encryption)
 #        sudo ./luks_encrypt.sh --start-phase=clevis
 #        sudo ./luks_encrypt.sh --start-phase=restore --backup-dir=/tmp/luks-backup.abc123
 #        sudo ./luks_encrypt.sh --list-phases
+#
+# Fully non-interactive (offline card, nothing is asked):
+#        sudo ./luks_encrypt.sh --device=/dev/sdX --yes --passphrase-file=/path/to/pass \
+#             --tang=http://a,http://b --keep-backup
 
 set -euo pipefail
 
@@ -24,6 +31,17 @@ SPI_ONLY=false
 START_PHASE=""
 BACKUP_DIR_OVERRIDE=""
 LIST_PHASES=false
+YES_MODE=false                    # --yes: answer every confirmation prompt (no SPI flash)
+PASSPHRASE_FILE=""                # --passphrase-file=<path>: LUKS passphrase, first line
+TANG_ARG=""                       # --tang=<url1>,<url2>: tang servers (override script and luks.conf)
+KEEP_BACKUP=false                 # --keep-backup: keep the backup directory, do not ask
+REMOVE_BACKUP=false               # --remove-backup: remove the backup directory, do not ask
+DEVICE_ARG=""                     # --device=<dev>: target device, skips the interactive prompt
+ALLOW_LOOP=false                  # --allow-loop: accept /dev/loopN as target (test only)
+# Offline mode state, filled from luks.conf (see _read_offline_conf)
+FIRST_BOOT_PENDING=""             # "yes": the card was never booted (rpi_offline)
+NET_DRIVERS=""                    # space separated NIC modules the initramfs must contain
+OFFLINE_HOST_DEVICE=""            # host device the card was prepared on (hint only)
 for arg in "$@"; do
   case "$arg" in
     -h|--help)
@@ -35,16 +53,36 @@ for arg in "$@"; do
       echo "  - Raspberry Pi: runs on EXTERNAL machine with Pi's SD/NVMe plugged in"
       echo "  - Armbian NVMe/USB migration: runs LOCALLY on the same board"
       echo "  - Armbian in-place: runs from SD card against eMMC"
+      echo "  - Raspberry Pi OS card prepared offline (luks_prepare.sh --offline, scenario rpi_offline):"
+      echo "    the card was never booted; its first-boot state is kept intact and verified"
       echo ""
       echo "Prerequisites:"
       echo "  - luks_prepare.sh has been run on the target board first"
       echo "  - cryptsetup, clevis, clevis-luks, curl, jq, rsync installed"
       echo ""
       echo "Options:"
+      echo "  --device=DEV           Target device (e.g., /dev/sdb); skips the device prompt. DEV must be a"
+      echo "                         whole disk, not mounted and not part of the running system. The device"
+      echo "                         layout and the final YES confirmation are still shown"
+      echo "  --allow-loop           Accept a loop device (/dev/loopN with /dev/loopNp1 and p2) as target."
+      echo "                         For tests with an image file only, never for real cards"
+      echo "  --yes                  Non-interactive: answer every confirmation (Continue?, Type YES) with yes,"
+      echo "                         the SPI flash question with no. The device is NOT prompted for: --device="
+      echo "                         is required. A typed passphrase is still asked, and a too short one is"
+      echo "                         still confirmed, unless --passphrase-file is used"
+      echo "  --passphrase-file=PATH LUKS passphrase: first line of PATH, only the trailing newline is stripped."
+      echo "                         Used for luksFormat, luksOpen and the clevis binding. The file is only read,"
+      echo "                         never changed or deleted. Fails if missing, empty or shorter than ${MIN_PASSPHRASE_LEN:-8}"
+      echo "                         characters (no 'use anyway?' question)"
+      echo "  --tang=URL1,URL2       Exactly two tang servers (SSS threshold 2), override script and luks.conf"
+      echo "  --keep-backup          Keep the backup directory at the end without asking"
+      echo "  --remove-backup        Remove the backup directory at the end without asking"
+      echo "                         (mutually exclusive with --keep-backup)"
       echo "  --lv-size=SIZE         Set root LV size (e.g., 50G, 50%FREE; default: 100%FREE)"
       echo "  --spi-only             Flash U-Boot to SPI only (skip encryption)"
       echo "  --start-phase=PHASE    Resume from a specific phase (name or number)"
-      echo "  --backup-dir=PATH      Specify backup directory (for --start-phase resume)"
+      echo "  --backup-dir=PATH      Fresh run: directory in which the backup is created (never asks for one,"
+      echo "                         fails if it is too small). With --start-phase: the existing backup directory"
       echo "  --list-phases          List available phases and exit"
       echo "  -h, --help             Show this help"
       echo ""
@@ -58,13 +96,29 @@ for arg in "$@"; do
       echo "  7. clevis       Clevis/Tang SSS binding"
       echo "  8. verify       Verification, cleanup, SPI flash"
       echo ""
+      echo "Without a terminal on stdin every question that is still open fails with a message naming the"
+      echo "option that avoids it."
+      echo ""
       echo "Examples:"
       echo "  sudo ./luks_encrypt.sh"
+      echo "  # fully non-interactive (offline card):"
+      echo "  sudo ./luks_encrypt.sh --device=/dev/sdX --yes --passphrase-file=/path/to/pass --tang=http://a,http://b --keep-backup"
+      echo "  sudo ./luks_encrypt.sh --device=/dev/sdb"
       echo "  sudo ./luks_encrypt.sh --lv-size=50G"
       echo "  sudo ./luks_encrypt.sh --start-phase=clevis"
       echo "  sudo ./luks_encrypt.sh --start-phase=restore --backup-dir=/tmp/luks-backup.abc123"
       exit 0
       ;;
+    --device=?*) DEVICE_ARG="${arg#--device=}" ;;
+    --device|--device=) echo "--device requires a value: --device=/dev/sdX"; exit 1 ;;
+    --allow-loop) ALLOW_LOOP=true ;;
+    --yes) YES_MODE=true ;;
+    --passphrase-file=?*) PASSPHRASE_FILE="${arg#--passphrase-file=}" ;;
+    --passphrase-file|--passphrase-file=) echo "--passphrase-file requires a value: --passphrase-file=/path/to/file"; exit 1 ;;
+    --tang=?*) TANG_ARG="${arg#--tang=}" ;;
+    --tang|--tang=) echo "--tang requires a value: --tang=http://a,http://b"; exit 1 ;;
+    --keep-backup) KEEP_BACKUP=true ;;
+    --remove-backup) REMOVE_BACKUP=true ;;
     --spi-only) SPI_ONLY=true ;;
     --lv-size=*) LVM_ROOT_SIZE="${arg#--lv-size=}" ;;
     --start-phase=*) START_PHASE="${arg#--start-phase=}" ;;
@@ -86,6 +140,11 @@ PHASE_DESCRIPTIONS=(
   "Clevis/Tang SSS binding"
   "Verification, cleanup, SPI flash"
 )
+
+if [ "$KEEP_BACKUP" = true ] && [ "$REMOVE_BACKUP" = true ]; then
+  echo "--keep-backup and --remove-backup are mutually exclusive"
+  exit 1
+fi
 
 if [ "$LIST_PHASES" = true ]; then
   echo "Available phases for --start-phase:"
@@ -137,7 +196,7 @@ LUKS_MAPPER_NAME="rootfs"
 USE_LVM=true                  # Set to false for LUKS-only (no LVM layer)
 LVM_VG_NAME="pivg"            # Volume group name
 LVM_LV_NAME="root"            # Logical volume name for root filesystem
-LVM_ROOT_SIZE="${LVM_ROOT_SIZE:-}"  # LV size — set via --lv-size=<size> (e.g., "50G", "50%FREE") — empty = 100%FREE
+LVM_ROOT_SIZE="${LVM_ROOT_SIZE:-}"  # LV size - set via --lv-size=<size> (e.g., "50G", "50%FREE") - empty = 100%FREE
 BACKUP_VERIFY_PCT=90              # Minimum % of files expected after backup/restore (sanity check)
 MIN_PASSPHRASE_LEN=8              # Minimum LUKS passphrase length
 TANG_TIMEOUT=5                    # Timeout in seconds for tang server connectivity checks
@@ -161,6 +220,51 @@ info()  { echo -e "${CYAN}[INFO]${NC} $*"; }
 warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; WARNINGS+=("$*"); }
 ok()    { echo -e "${GREEN}[OK]${NC} $*"; }
 fail()  { echo -e "${RED}[FAIL]${NC} $*" >&2; exit 1; }
+
+# --- Prompts (every question goes through these two helpers) ---
+# Without a terminal on stdin a question cannot be answered: fail with a
+# message naming the option that avoids it, instead of hanging or reading EOF.
+
+# Ask a yes/no question. Returns 0 for yes, 1 for no.
+# --yes answers it automatically with <yes-mode answer> (yes, no) or, for
+# "ask", still asks.
+# Usage: _ask_confirm "<prompt>" "<option avoiding the prompt>" [yes|no|ask] [exact word]
+#   exact word: the answer must equal it (e.g. YES), else y/Y counts
+_ask_confirm() {
+  local prompt="$1" opt="$2" yesmode="${3:-yes}" exact="${4:-}" ans
+  if [ "$YES_MODE" = true ] && [ "$yesmode" != "ask" ]; then
+    info "--yes: '${prompt%"${prompt##*[![:space:]]}"}' -> ${yesmode}"
+    if [ "$yesmode" = "yes" ]; then return 0; fi
+    return 1
+  fi
+  if [ ! -t 0 ]; then
+    fail "A question needs an answer but stdin is not a terminal: ${prompt%"${prompt##*[![:space:]]}"}
+       Use ${opt} to avoid the prompt."
+  fi
+  read -rp "$prompt" ans
+  if [ -n "$exact" ]; then
+    [ "$ans" = "$exact" ]
+  else
+    [[ "$ans" == [yY] ]]
+  fi
+}
+
+# Ask for a value (hidden input if the 4th argument is "secret") into a variable.
+# Usage: _ask_value <variable> "<prompt>" "<option avoiding the prompt>" [secret]
+_ask_value() {
+  local __var="$1" __prompt="$2" __opt="$3" __secret="${4:-}" __v
+  if [ ! -t 0 ]; then
+    fail "Input needed but stdin is not a terminal: ${__prompt%"${__prompt##*[![:space:]]}"}
+       Use ${__opt} to avoid the prompt."
+  fi
+  if [ "$__secret" = "secret" ]; then
+    read -rsp "$__prompt" __v
+    echo ""
+  else
+    read -rp "$__prompt" __v
+  fi
+  printf -v "$__var" '%s' "$__v"
+}
 
 # --- Target storage health ---
 # A flaky card reader / USB bridge can reset mid-run: writes are lost, ext4
@@ -227,12 +331,28 @@ _check_target_health() {
   fi
 }
 
+# --- Board / scenario helpers ---
+
+# True for Raspberry Pi layouts: /boot/firmware, initramfs* on the boot
+# partition, cmdline.txt. The offline scenario (rpi_offline) is a Raspberry Pi
+# card as well; luks_prepare.sh stages BOARD_TYPE="rpi" for it, the scenario
+# check keeps this true even if that value is missing.
+_is_rpi() {
+  [ "${BOARD_TYPE:-}" = "rpi" ] || [ "${SCENARIO:-}" = "rpi_offline" ]
+}
+
+# True while the card has never been booted (offline mode): the first boot of
+# the Pi is still ahead and must find the image state untouched.
+_first_boot_pending() {
+  [ "${FIRST_BOOT_PENDING:-}" = "yes" ]
+}
+
 # --- Initramfs verification ---
 
 # Print the initramfs images on the mounted boot partition, one per line.
 _initramfs_images() {
   [ -n "${MOUNT_BOOT:-}" ] && mountpoint -q "$MOUNT_BOOT" 2>/dev/null || return 0
-  if [ "$BOARD_TYPE" = "rpi" ]; then
+  if _is_rpi; then
     find "$MOUNT_BOOT" -maxdepth 1 -type f -name 'initramfs*' | sort
   else
     find "$MOUNT_BOOT" -maxdepth 1 -type f -name 'initrd.img-*' | sort
@@ -247,21 +367,78 @@ _list_initramfs() {
     lsinitramfs "$img"
   elif [ -n "${MOUNT_DST:-}" ] && [ -x "${MOUNT_DST}/usr/bin/lsinitramfs" ] \
        && mountpoint -q "${MOUNT_DST}/proc" 2>/dev/null; then
-    if [ "$BOARD_TYPE" = "rpi" ]; then chroot_boot=/boot/firmware; else chroot_boot=/boot; fi
+    if _is_rpi; then chroot_boot=/boot/firmware; else chroot_boot=/boot; fi
     chroot "$MOUNT_DST" lsinitramfs "${chroot_boot}${img#"$MOUNT_BOOT"}"
   else
     return 2
   fi
 }
 
+# Check the network drivers (NET_DRIVERS, offline mode: no running system to
+# detect the NIC from) of one initramfs image against the kernel it was built
+# for. Several kernels (e.g. initramfs_2712 and initramfs8 on a Pi 5) do not all
+# provide every driver as a module, so per image and driver:
+#   - listed in the kernel's modules.builtin (on the mounted root): present
+#   - else listed in its modules.dep: the module file must be in the image
+#     (<name>.ko, optional compression suffix), otherwise fatal
+#   - else the kernel has no such driver: warning only
+# Fatal as well: the kernel version is unknown, or no driver at all is present.
+# '-' and '_' are equivalent in module names.
+# Usage: _check_net_drivers "<image name>" "<lsinitramfs listing>"
+# Returns 1 if the image has no usable network driver set.
+_check_net_drivers() {
+  local name="$1" listing="$2" kver moddir drv drv_re present=0 bad=0 _d
+  [ -n "${NET_DRIVERS:-}" ] || return 0
+  kver=$(sed -nE 's#^(\./)?(usr/)?lib/modules/([^/]+)/.*#\3#p' <<<"$listing" | head -1 || true)
+  if [ -z "$kver" ]; then
+    warn "${name}: no lib/modules/<kernel>/ inside, cannot tell which kernel it is for"
+    return 1
+  fi
+  moddir=""
+  if [ -n "${MOUNT_DST:-}" ]; then
+    for _d in "${MOUNT_DST}/usr/lib/modules/${kver}" "${MOUNT_DST}/lib/modules/${kver}"; do
+      if [ -f "${_d}/modules.dep" ] || [ -f "${_d}/modules.builtin" ]; then moddir="$_d"; break; fi
+    done
+  fi
+  if [ -z "$moddir" ]; then
+    warn "${name}: no modules.dep / modules.builtin for kernel ${kver} on the mounted root, cannot judge the network drivers"
+    return 1
+  fi
+  for drv in $NET_DRIVERS; do
+    drv_re="${drv//[-_]/[-_]}"
+    if [ -f "${moddir}/modules.builtin" ] \
+       && grep -Eq "(^|/)${drv_re}\.ko\$" "${moddir}/modules.builtin"; then
+      present=$((present + 1))
+      info "${name}: ${drv} is built into kernel ${kver}"
+    elif [ ! -f "${moddir}/modules.dep" ] \
+         || grep -Eq "(^|/)${drv_re}\.ko(\.[a-z0-9]+)?:" "${moddir}/modules.dep"; then
+      if grep -Eq "/${drv_re}\.ko(\.[a-z0-9]+)?\$" <<<"$listing"; then
+        present=$((present + 1))
+      else
+        warn "${name}: ${drv} is a module of kernel ${kver} but is NOT inside the image. No network, no tang unlock at boot"
+        bad=1
+      fi
+    else
+      warn "${name}: kernel ${kver} has no driver ${drv}, ignored"
+    fi
+  done
+  if [ "$present" -eq 0 ]; then
+    warn "${name}: none of the network drivers (${NET_DRIVERS}) is present for kernel ${kver}. No network, no tang unlock at boot"
+    bad=1
+  fi
+  return "$bad"
+}
+
 # Check every initramfs image on the boot partition: it must contain the
 # cryptsetup crypttab (otherwise the root is never unlocked and boot ends in
-# "ALERT! <root> does not exist") and clevis. With a checksum list from before
+# "ALERT! <root> does not exist") and clevis, and the network drivers of its
+# kernel if NET_DRIVERS is set (_check_net_drivers; needs the root mounted at
+# MOUNT_DST). With a checksum list from before
 # the rebuild ("sha256  path" lines), every image must also have changed.
 # Usage: _verify_initramfs_images ["<sha256sum output before rebuild>"]
 # Returns 1 if any image is missing, stale or incomplete.
 _verify_initramfs_images() {
-  local pre_sums="${1:-}" img name listing pre_sum bad=0
+  local pre_sums="${1:-}" img name listing pre_sum bad=0 missing
   local images=()
   mapfile -t images < <(_initramfs_images)
   if [ "${#images[@]}" -eq 0 ]; then
@@ -291,14 +468,190 @@ _verify_initramfs_images() {
       warn "${name}: no clevis inside, no tang auto-unlock"
       bad=1
     fi
-    if ! grep -q 'cryptroot/crypttab' <<<"$listing" || ! grep -q 'clevis' <<<"$listing"; then
+    missing=""
+    if ! _check_net_drivers "$name" "$listing"; then
+      missing="yes"
+      bad=1
+    fi
+    if ! grep -q 'cryptroot/crypttab' <<<"$listing" || ! grep -q 'clevis' <<<"$listing" || [ -n "$missing" ]; then
       continue
     fi
-    ok "${name}: crypttab and clevis present ($(grep -c clevis <<<"$listing") clevis files)"
+    ok "${name}: crypttab and clevis present ($(grep -c clevis <<<"$listing") clevis files)${NET_DRIVERS:+, network drivers checked: ${NET_DRIVERS}}"
   done
   return "$bad"
 }
 INITRAMFS_VERIFIED=false
+
+# --- Offline mode: "never booted" state of the card ---
+# The Pi has not booted this card yet. Its first boot (systemd ConditionFirstBoot,
+# regenerate_ssh_host_keys, cloud-init NoCloud) only works if the image still
+# looks untouched. Everything run in the chroot (update-initramfs and the
+# package hooks behind it) must leave these traces as it found them.
+
+# Print one line per violation of the never-booted state of the mounted target.
+# Scope "root": root filesystem only (MOUNT_DST).
+# Scope "full": additionally the boot partition (MOUNT_BOOT): cloud-init seed
+# and cmdline.txt.
+# Usage: _never_booted_findings root|full
+_never_booted_findings() {
+  local scope="$1" root="${MOUNT_DST:-}" boot="${MOUNT_BOOT:-}" mid f cl
+  if [ -L "${root}/etc/machine-id" ] || [ ! -f "${root}/etc/machine-id" ]; then
+    echo "/etc/machine-id is missing or a symlink (must be a file containing 'uninitialized')"
+  else
+    mid=$(cat "${root}/etc/machine-id" 2>/dev/null || true)
+    if [ "$mid" != "uninitialized" ]; then
+      echo "/etc/machine-id is '${mid}', must be exactly 'uninitialized' (the first boot logic would be skipped)"
+    fi
+  fi
+  while IFS= read -r f; do
+    [ -n "$f" ] && echo "SSH host key present: ${f#"$root"} (the image ships none, regenerate_ssh_host_keys creates them)"
+  done < <(find "${root}/etc/ssh" -maxdepth 1 -name 'ssh_host_*' 2>/dev/null | sort)
+  if [ -e "${root}/var/lib/cloud/instance" ] || [ -L "${root}/var/lib/cloud/instance" ]; then
+    echo "/var/lib/cloud/instance exists: cloud-init already ran, it would skip the NoCloud seed"
+  fi
+  if [ -e "${root}/usr/sbin/policy-rc.d" ] || [ -L "${root}/usr/sbin/policy-rc.d" ]; then
+    echo "/usr/sbin/policy-rc.d is still present (it would block every service start on the Pi)"
+  fi
+  if [ -e "${root}/usr/bin/qemu-aarch64-static" ] || [ -L "${root}/usr/bin/qemu-aarch64-static" ]; then
+    echo "/usr/bin/qemu-aarch64-static is still present (leftover of the chroot)"
+  fi
+  [ "$scope" = "full" ] || return 0
+
+  for f in user-data meta-data; do
+    if [ ! -f "${boot}/${f}" ]; then
+      echo "${f} missing on the boot partition (cloud-init seed, the Pi would be unreachable)"
+    fi
+  done
+  if [ ! -f "${boot}/cmdline.txt" ]; then
+    echo "cmdline.txt missing on the boot partition"
+  else
+    cl=$(cat "${boot}/cmdline.txt")
+    _cmdline_findings "$cl" yes
+  fi
+}
+
+# Print one line per problem of a cmdline.txt content for a never-booted card:
+# no ' resize' (the initramfs resize_early breaks on the LVM root) and, if
+# required, the cloud-init instance ID 'ds=nocloud;i=' still present.
+# Usage: _cmdline_findings "<cmdline>" yes|no   (second argument: require ds=)
+_cmdline_findings() {
+  local cl="$1" require_ds="$2"
+  if [[ "$cl" =~ (^|[[:space:]])resize([[:space:]]|$) ]]; then
+    echo "cmdline.txt contains ' resize' (resize_early would fail on the encrypted LVM root)"
+  fi
+  if [ "$require_ds" = "yes" ] && [[ "$cl" != *"ds=nocloud;i="* ]]; then
+    echo "cmdline.txt has no 'ds=nocloud;i=' (cloud-init would not find its seed)"
+  fi
+}
+
+# Phase bootconfig check for a never-booted card: the new cmdline.txt must have
+# no ' resize' and must still contain 'ds=nocloud;i=' if the original had it
+# (otherwise cloud-init skips the NoCloud seed). Fatal. A no-op unless the
+# first boot is pending.
+# Usage: _check_cmdline_first_boot "<new cmdline>" "<original cmdline(s)>"
+_check_cmdline_first_boot() {
+  local new="$1" orig="$2" need_ds=no findings
+  _first_boot_pending || return 0
+  if [[ "$orig" == *"ds=nocloud;i="* ]]; then need_ds=yes; fi
+  findings=$(_cmdline_findings "$new" "$need_ds")
+  if [ -n "$findings" ]; then
+    while IFS= read -r _l; do warn "$_l"; done <<<"$findings"
+    fail "The new cmdline.txt would break the first boot of the never-booted card (see above).
+       cmdline.txt was NOT changed. Fix the cmdline.txt on the boot partition (or re-run
+       luks_prepare.sh --offline), then resume with: sudo ./luks_encrypt.sh --start-phase=bootconfig${BACKUP_DIR:+ --backup-dir=$BACKUP_DIR}"
+  fi
+}
+
+# State of the chroot, saved before and restored after the initramfs rebuild.
+# The restore also runs from the EXIT trap, so it covers failure paths.
+FB_STATE_DIR=""    # scratch dir with the saved copies
+FB_ARMED=false     # true while chroot modifications still await the restore
+FB_PATHS=()        # target-relative paths whose original state is saved
+FB_SSH_PRE=""      # SSH host keys that existed before the chroot was used
+
+# Save the state of one path of the target root (absent, file or symlink).
+# Usage: _fb_save_path <path relative to the target root>
+_fb_save_path() {
+  local rel="$1" abs key
+  abs="${MOUNT_DST}/${rel}"
+  key="${rel//\//_}"
+  if [ -L "$abs" ] || [ -f "$abs" ]; then
+    cp -a --no-dereference "$abs" "${FB_STATE_DIR}/${key}.data"
+    : > "${FB_STATE_DIR}/${key}.present"
+  elif [ -e "$abs" ]; then
+    fail "${rel} is neither a file nor a symlink, refusing to touch the first-boot state"
+  fi
+  FB_PATHS+=("$rel")
+}
+
+# Restore one saved path exactly as it was (content, mode, owner, times, symlink).
+# Usage: _fb_restore_path <path relative to the target root>
+_fb_restore_path() {
+  local rel="$1" abs key
+  abs="${MOUNT_DST}/${rel}"
+  key="${rel//\//_}"
+  rm -f "$abs" || return 1
+  if [ -e "${FB_STATE_DIR}/${key}.present" ]; then
+    cp -a --no-dereference "${FB_STATE_DIR}/${key}.data" "$abs" || return 1
+  fi
+}
+
+# Arm the first-boot protection before the chroot is used. Always saves the
+# path of the qemu copy (removed again afterwards in every scenario). While
+# FIRST_BOOT_PENDING=yes it also saves machine-id and dbus machine-id, records
+# the SSH host keys and installs policy-rc.d (exit 101: no service starts).
+# update-initramfs does not use apt, so /etc/resolv.conf stays untouched.
+_fb_arm() {
+  FB_STATE_DIR=$(mktemp -d /tmp/luks-fbstate.XXXXXX)
+  FB_PATHS=()
+  _fb_save_path usr/bin/qemu-aarch64-static
+  if _first_boot_pending; then
+    _fb_save_path etc/machine-id
+    _fb_save_path var/lib/dbus/machine-id
+    _fb_save_path usr/sbin/policy-rc.d
+    FB_SSH_PRE=$(find "${MOUNT_DST}/etc/ssh" -maxdepth 1 -name 'ssh_host_*' 2>/dev/null | sort)
+    mkdir -p "${MOUNT_DST}/usr/sbin"
+    printf '#!/bin/sh\nexit 101\n' > "${MOUNT_DST}/usr/sbin/policy-rc.d"
+    chmod 755 "${MOUNT_DST}/usr/sbin/policy-rc.d"
+    info "First-boot protection armed (machine-id saved, policy-rc.d installed)"
+  fi
+  FB_ARMED=true
+}
+
+# Undo everything the chroot may have changed: restore the saved paths in
+# reverse order (machine-id files exactly, policy-rc.d and the qemu copy removed
+# or put back), and delete SSH host keys created in the chroot (with a warning).
+# Idempotent; called after a successful rebuild and from cleanup(). Does not
+# exit: the caller decides. Returns 1 if something could not be restored.
+_fb_restore() {
+  local rc=0 i f
+  [ "$FB_ARMED" = true ] || return 0
+  if [ -z "${MOUNT_DST:-}" ] || ! mountpoint -q "$MOUNT_DST" 2>/dev/null; then
+    warn "Cannot restore the first-boot state: target root is not mounted"
+    return 1
+  fi
+  for (( i=${#FB_PATHS[@]}-1 ; i>=0 ; i-- )); do
+    _fb_restore_path "${FB_PATHS[$i]}" || { warn "Could not restore ${FB_PATHS[$i]}"; rc=1; }
+  done
+  if _first_boot_pending; then
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      case $'\n'"$FB_SSH_PRE"$'\n' in
+        *$'\n'"$f"$'\n'*) continue ;;
+      esac
+      if rm -f "$f"; then
+        warn "SSH host key ${f#"$MOUNT_DST"} was created in the chroot and has been deleted"
+      else
+        warn "Could not delete SSH host key ${f#"$MOUNT_DST"} created in the chroot"
+        rc=1
+      fi
+    done < <(find "${MOUNT_DST}/etc/ssh" -maxdepth 1 -name 'ssh_host_*' 2>/dev/null | sort)
+  fi
+  rm -rf "$FB_STATE_DIR"
+  FB_ARMED=false
+  [ "$rc" -eq 0 ] && info "Chroot leftovers removed and first-boot state restored"
+  return "$rc"
+}
 
 # Cleanup function
 CLEANUP_MOUNTS=()
@@ -309,6 +662,11 @@ BACKUP_DIR_FOR_CLEANUP=""
 cleanup() {
   set +e
   info "Cleaning up..."
+
+  # Undo chroot changes first (needs the target root still mounted): machine-id,
+  # policy-rc.d, qemu copy, stray SSH host keys. Covers every failure path.
+  _fb_restore
+  if [ "$FB_ARMED" != true ] && [ -n "$FB_STATE_DIR" ]; then rm -rf "$FB_STATE_DIR"; fi
 
   # Unmount in reverse order
   for (( i=${#CLEANUP_MOUNTS[@]}-1 ; i>=0 ; i-- )); do
@@ -354,6 +712,45 @@ BACKUP_BASE=""
 BACKUP_DIR=""
 BACKUP_COUNT=0
 
+# --tang=<url1>,<url2>: replaces the servers of the script; luks.conf only fills
+# empty entries, so it cannot override them. Exactly the count the script has
+# (two servers, SSS threshold 2).
+_apply_tang_arg() {
+  local list="$1" commas n url
+  local urls=()
+  commas="${list//[^,]/}"
+  n=$(( ${#commas} + 1 ))
+  if [ "$n" -ne "${#TANG_SERVERS[@]}" ]; then
+    fail "--tang needs exactly ${#TANG_SERVERS[@]} comma separated URLs (SSS threshold ${SSS_THRESHOLD}), got ${n}"
+  fi
+  IFS=',' read -r -a urls <<<"$list"
+  # read drops a trailing empty field ("a,b,"): that is an empty URL
+  [ "${#urls[@]}" -eq "$n" ] || fail "--tang contains an empty URL"
+  for url in "${urls[@]}"; do
+    [ -n "$url" ] || fail "--tang contains an empty URL"
+  done
+  TANG_SERVERS=("${urls[@]}")
+}
+
+# --passphrase-file=<path>: LUKS passphrase = first line, only the newline is
+# stripped. The file is only read (no ownership or mode requirements) and never
+# removed. Non-interactive mode cannot ask "use anyway?", so a short one fails.
+_load_passphrase_file() {
+  local file="$1"
+  [ -f "$file" ] || fail "Passphrase file not found: $file"
+  if ! { IFS= read -r LUKS_PASS || [ -n "$LUKS_PASS" ]; } < "$file"; then
+    LUKS_PASS=""
+  fi
+  [ -n "$LUKS_PASS" ] || fail "Passphrase file is empty or unreadable (first line): $file"
+  if [ "${#LUKS_PASS}" -lt "$MIN_PASSPHRASE_LEN" ]; then
+    LUKS_PASS=""
+    fail "Passphrase in $file is shorter than ${MIN_PASSPHRASE_LEN} characters. Use a longer one (non-interactive mode does not ask 'use anyway?')."
+  fi
+}
+
+if [ -n "$TANG_ARG" ]; then _apply_tang_arg "$TANG_ARG"; fi
+if [ -n "$PASSPHRASE_FILE" ]; then _load_passphrase_file "$PASSPHRASE_FILE"; fi
+
 # --- Prerequisite setup functions for --start-phase resume ---
 
 _ensure_luks_open() {
@@ -361,7 +758,11 @@ _ensure_luks_open() {
     info "LUKS device already open: /dev/mapper/$LUKS_MAPPER_NAME"
   else
     info "Opening LUKS device on $EXT_ROOT_PART..."
-    cryptsetup luksOpen "$EXT_ROOT_PART" "$LUKS_MAPPER_NAME"
+    if [ -n "$LUKS_PASS" ]; then
+      printf '%s' "$LUKS_PASS" | cryptsetup luksOpen "$EXT_ROOT_PART" "$LUKS_MAPPER_NAME" -
+    else
+      cryptsetup luksOpen "$EXT_ROOT_PART" "$LUKS_MAPPER_NAME"
+    fi
     CLEANUP_LUKS="$LUKS_MAPPER_NAME"
   fi
   LUKS_UUID=$(blkid -s UUID -o value "$EXT_ROOT_PART")
@@ -394,6 +795,20 @@ _ensure_boot_mounted() {
   info "Mounting boot partition ($EXT_BOOT_PART) at $MOUNT_BOOT..."
   mount "$EXT_BOOT_PART" "$MOUNT_BOOT"
   CLEANUP_MOUNTS+=("$MOUNT_BOOT")
+}
+
+# When resuming, luks.conf may not have been readable earlier (the root is LUKS
+# by then). Once the encrypted root is mounted, read the offline keys from the
+# staged copy there. Fills only what is still unset.
+_load_offline_state_from_root() {
+  local conf="${MOUNT_DST}/root/luks-staged/luks.conf"
+  [ -f "$conf" ] || return 0
+  if [ -z "$SCENARIO" ]; then
+    SCENARIO=$(grep '^SCENARIO=' "$conf" | cut -d'"' -f2 || true)
+  fi
+  _read_offline_conf "$conf"
+  _normalize_offline_state
+  return 0
 }
 
 _find_backup_dir() {
@@ -455,7 +870,7 @@ if [ "$SPI_ONLY" = true ]; then
   fi
 
   if [ "$IS_RK3588" != true ]; then
-    fail "Not an RK3588 board — SPI flash not applicable"
+    fail "Not an RK3588 board - SPI flash not applicable"
   fi
 
   info "Detected RK3588 SoC"
@@ -477,7 +892,7 @@ if [ "$SPI_ONLY" = true ]; then
     \( -name "rkspi_loader*.img" -o -name "u-boot-rockchip-spi*.bin" \) 2>/dev/null)
 
   if [ ${#SPI_IMAGES[@]} -eq 0 ]; then
-    fail "No U-Boot SPI images found in /usr/lib/linux-u-boot-*/ — install the u-boot package for your board"
+    fail "No U-Boot SPI images found in /usr/lib/linux-u-boot-*/ - install the u-boot package for your board"
   fi
 
   echo ""
@@ -487,13 +902,18 @@ if [ "$SPI_ONLY" = true ]; then
     echo "  $((i+1)). ${SPI_IMAGES[$i]} (${IMG_SIZE} bytes)"
   done
 
+  if [ "$YES_MODE" = true ]; then
+    info "--yes answers the SPI flash question with no: nothing flashed."
+    exit 0
+  fi
+
   SPI_IMAGE=""
   if [ ${#SPI_IMAGES[@]} -eq 1 ]; then
     SPI_IMAGE="${SPI_IMAGES[0]}"
   else
     echo ""
     while true; do
-      read -rp "Select image number [1-${#SPI_IMAGES[@]}]: " IMG_NUM
+      _ask_value IMG_NUM "Select image number [1-${#SPI_IMAGES[@]}]: " "--yes (skips the SPI flash)"
       if [[ "$IMG_NUM" =~ ^[0-9]+$ ]] && [ "$IMG_NUM" -ge 1 ] && [ "$IMG_NUM" -le ${#SPI_IMAGES[@]} ]; then
         SPI_IMAGE="${SPI_IMAGES[$((IMG_NUM-1))]}"
         break
@@ -507,9 +927,7 @@ if [ "$SPI_ONLY" = true ]; then
     warn "SPI flash already contains a bootloader. This will overwrite it."
   fi
   info "Image: $SPI_IMAGE"
-  read -rp "Write U-Boot to SPI flash for NVMe boot? [y/N] " FLASH_CONFIRM
-
-  if [[ "$FLASH_CONFIRM" != [yY] ]]; then
+  if ! _ask_confirm "Write U-Boot to SPI flash for NVMe boot? [y/N] " "--yes (skips the SPI flash)" no; then
     echo "Aborted."
     exit 0
   fi
@@ -535,9 +953,9 @@ if [ "$SPI_ONLY" = true ]; then
 
   VERIFY_DATA=$(dd if=/dev/mtdblock0 bs=512 count=1 2>/dev/null | od -A n -t x1 | tr -d ' \n')
   if [ -n "$(echo "$VERIFY_DATA" | tr -d '0')" ]; then
-    ok "SPI flash verified — U-Boot written successfully"
+    ok "SPI flash verified - U-Boot written successfully"
   else
-    fail "SPI flash verification failed — data appears empty after write"
+    fail "SPI flash verification failed - data appears empty after write"
   fi
 
   echo ""
@@ -587,7 +1005,7 @@ _detect_ext_partitions() {
   local dev="$1"
   local p1 p2
 
-  if [[ "$dev" == *nvme* ]] || [[ "$dev" == *mmcblk* ]]; then
+  if [[ "$dev" == *nvme* ]] || [[ "$dev" == *mmcblk* ]] || [[ "$dev" == */loop[0-9]* ]]; then
     p1="${dev}p1"
     p2="${dev}p2"
   else
@@ -621,6 +1039,51 @@ _detect_ext_partitions() {
   fi
 }
 
+# Validate a device given with --device (the interactive prompt only checks that
+# it is a block device). Fails unless the device is
+#   - a block device and a whole disk (a loop device only with --allow-loop,
+#     where /dev/loopNp1 and p2 are the partitions),
+#   - not part of the running system (holding /, /boot, /boot/efi, /boot/firmware),
+#   - not mounted anywhere, including its partitions and anything stacked on
+#     them (skipped when resuming past the encrypt phase: the root is LUKS then).
+# Prints the canonical device path (symlinks like /dev/disk/by-id resolved).
+# Usage: EXT_DEVICE=$(_validate_target_device /dev/sdX)
+_validate_target_device() {
+  local dev="$1" real type mnt src anc mnts
+  [ -b "$dev" ] || fail "Device $dev not found (not a block device)"
+  real=$(readlink -f "$dev")
+  [ -b "$real" ] || fail "Device $dev resolves to $real, which is not a block device"
+
+  type=$(lsblk -dno TYPE "$real" 2>/dev/null | head -1 | tr -d ' ')
+  if [[ "$real" == /dev/loop* ]]; then
+    [ "$ALLOW_LOOP" = true ] || fail "$real is a loop device. Loop devices are only accepted with --allow-loop (test only)."
+    [ "$type" = "loop" ] || fail "$real is not a whole loop device (type: ${type:-unknown}); pass /dev/loopN, not a partition"
+  elif [ "$type" != "disk" ]; then
+    fail "$real is not a whole disk (type: ${type:-unknown}); pass the disk, e.g. /dev/sdb, not a partition"
+  fi
+
+  for mnt in / /boot /boot/efi /boot/firmware; do
+    mountpoint -q "$mnt" 2>/dev/null || continue
+    src=$(findmnt -n -o SOURCE "$mnt" 2>/dev/null || true)
+    [ -b "$src" ] || continue
+    for anc in $(lsblk -snro KNAME "$src" 2>/dev/null); do
+      if [ "/dev/$anc" = "$real" ]; then
+        fail "$real is part of the running system ($mnt is mounted from $src). Refusing."
+      fi
+    done
+  done
+
+  if [ "$START_PHASE_NUM" -le 2 ]; then
+    mnts=$(lsblk -nro MOUNTPOINTS "$real" 2>/dev/null || lsblk -nro MOUNTPOINT "$real" 2>/dev/null || true)
+    mnts=$(grep -v '^$' <<<"$mnts" || true)
+    if [ -n "$mnts" ]; then
+      fail "$real is in use, it (or a partition of it) is mounted at: $(tr '\n' ' ' <<<"$mnts")
+       Unmount it first."
+    fi
+  fi
+  echo "$real"
+}
+
 # Check if we were re-launched after auto-detection
 if [ -n "${_LUKS_REEXEC:-}" ] && [ -f "$AUTODETECT_CONF" ]; then
   EXT_DEVICE=$(grep '^EXT_DEVICE=' "$AUTODETECT_CONF" | cut -d'"' -f2)
@@ -635,7 +1098,8 @@ if [ -n "${_LUKS_REEXEC:-}" ] && [ -f "$AUTODETECT_CONF" ]; then
 fi
 
 # Try to detect if script is running from the storage medium
-if [ -z "$EXT_DEVICE" ]; then
+# (not with --device: the device was named explicitly)
+if [ -z "$EXT_DEVICE" ] && [ -z "$DEVICE_ARG" ]; then
   # realpath may fail if CWD is stale (e.g., after previous unmount); try /proc/self/exe or BASH_SOURCE
   SCRIPT_REAL=$(realpath "$0" 2>/dev/null || readlink -f "$0" 2>/dev/null || true)
   if [ -z "$SCRIPT_REAL" ] && [ -n "${BASH_SOURCE[0]:-}" ]; then
@@ -708,6 +1172,33 @@ fi
 # 1c. Detect local mode and board type
 # =====================================================================
 
+# Read the offline mode keys from a luks.conf into FIRST_BOOT_PENDING,
+# NET_DRIVERS and OFFLINE_HOST_DEVICE. Values already set are kept.
+# Usage: _read_offline_conf <luks.conf>
+_read_offline_conf() {
+  local conf="$1" v
+  v=$(grep '^FIRST_BOOT_PENDING=' "$conf" 2>/dev/null | cut -d'"' -f2 || true)
+  if [ -z "$FIRST_BOOT_PENDING" ]; then FIRST_BOOT_PENDING="$v"; fi
+  v=$(grep '^NET_DRIVERS=' "$conf" 2>/dev/null | cut -d'"' -f2 || true)
+  if [ -z "$NET_DRIVERS" ]; then NET_DRIVERS="$v"; fi
+  v=$(grep '^OFFLINE_HOST_DEVICE=' "$conf" 2>/dev/null | cut -d'"' -f2 || true)
+  if [ -z "$OFFLINE_HOST_DEVICE" ]; then OFFLINE_HOST_DEVICE="$v"; fi
+}
+
+# Make the scenario rpi_offline consistent: it is a Raspberry Pi card whose
+# first boot is still pending, even if luks.conf lacks BOARD_TYPE or
+# FIRST_BOOT_PENDING. A conflicting board type is refused.
+_normalize_offline_state() {
+  if [ "$SCENARIO" = "rpi_offline" ]; then
+    case "$BOARD_TYPE" in
+      ""|rpi) BOARD_TYPE="rpi" ;;
+      *) fail "Scenario rpi_offline with BOARD_TYPE=$BOARD_TYPE: only Raspberry Pi (rpi) is supported offline" ;;
+    esac
+    if [ -z "$FIRST_BOOT_PENDING" ]; then FIRST_BOOT_PENDING="yes"; fi
+  fi
+  return 0
+}
+
 # Try to read luks.conf from staged dir on the target root
 _read_luks_conf_from_root() {
   local mount_point="$1"
@@ -724,6 +1215,7 @@ _read_luks_conf_from_root() {
     _ts2=$(grep '^TANG_SERVER_2=' "$conf" | cut -d'"' -f2)
     [ -z "${TANG_SERVERS[0]}" ] && [ -n "$_ts1" ] && TANG_SERVERS[0]="$_ts1"
     [ -z "${TANG_SERVERS[1]}" ] && [ -n "$_ts2" ] && TANG_SERVERS[1]="$_ts2"
+    _read_offline_conf "$conf"
     return 0
   fi
   return 1
@@ -750,7 +1242,7 @@ if [ -n "$BOARD_TYPE" ]; then
       MODEL=$(tr -d '\0' < /proc/device-tree/model 2>/dev/null || echo "Armbian Board")
       echo -e "${YELLOW}${MODEL} LUKS Encryption Script${NC}"
       ;;
-    rpi)
+    rpi|rpi_offline)
       echo -e "${YELLOW}Raspberry Pi LUKS Encryption Script${NC}"
       ;;
     *)
@@ -768,12 +1260,24 @@ echo ""
 
 # Show available block devices
 info "Available block devices:"
-lsblk -d -o NAME,SIZE,MODEL,TRAN | grep -v "^loop"
+if [ "$ALLOW_LOOP" = true ]; then
+  lsblk -d -o NAME,SIZE,MODEL,TRAN
+else
+  lsblk -d -o NAME,SIZE,MODEL,TRAN | grep -v "^loop"
+fi
 echo ""
 
+if [ -n "$DEVICE_ARG" ]; then
+  # Device given on the command line: validate it, skip the prompt
+  EXT_DEVICE=$(_validate_target_device "${DEVICE_ARG%/}")
+  info "Target device (--device): $EXT_DEVICE"
+  _detect_ext_partitions "$EXT_DEVICE"
 # Ask for device if not auto-detected
-if [ -z "$EXT_DEVICE" ]; then
-  read -rp "Enter the target device (e.g., /dev/sdb or /dev/nvme0n1): " EXT_DEVICE
+elif [ -z "$EXT_DEVICE" ]; then
+  if [ "$YES_MODE" = true ]; then
+    fail "--yes never prompts for the target device: pass --device=/dev/sdX (the card is chosen explicitly, not guessed)."
+  fi
+  _ask_value EXT_DEVICE "Enter the target device (e.g., /dev/sdb or /dev/nvme0n1): " "--device=<dev>"
   EXT_DEVICE="${EXT_DEVICE%/}"  # strip trailing slash
 
   if [ ! -b "$EXT_DEVICE" ]; then
@@ -803,7 +1307,7 @@ if [ ! -b "$EXT_ROOT_PART" ]; then
   fail "Root partition not found: $EXT_ROOT_PART"
 fi
 
-# Verify partitions are not mounted (skip when resuming past encrypt — partition is LUKS now)
+# Verify partitions are not mounted (skip when resuming past encrypt - partition is LUKS now)
 if [ "$START_PHASE_NUM" -le 2 ]; then
   if findmnt -rn "$EXT_ROOT_PART" &>/dev/null; then
     fail "Root partition $EXT_ROOT_PART is currently mounted. Unmount it first."
@@ -847,7 +1351,7 @@ if [ -z "$PI_DEVICE" ] || [ -z "$PI_BOOT_PART" ] || [ -z "$PI_ROOT_PART" ]; then
       fi
       umount "$MOUNT_TMP_ROOT" 2>/dev/null || true
     else
-      # Mount failed — partition may be corrupted from a previous failed cryptsetup attempt.
+      # Mount failed - partition may be corrupted from a previous failed cryptsetup attempt.
       # Try reading luks.conf from an existing backup directory instead.
       _bkp_conf=""
       if [ -n "$BACKUP_DIR_OVERRIDE" ] && [ -f "${BACKUP_DIR_OVERRIDE}/root/luks-staged/luks.conf" ]; then
@@ -872,6 +1376,7 @@ if [ -z "$PI_DEVICE" ] || [ -z "$PI_BOOT_PART" ] || [ -z "$PI_ROOT_PART" ]; then
         _ts2=$(grep '^TANG_SERVER_2=' "$_bkp_conf" | cut -d'"' -f2)
         [ -z "${TANG_SERVERS[0]}" ] && [ -n "$_ts1" ] && TANG_SERVERS[0]="$_ts1"
         [ -z "${TANG_SERVERS[1]}" ] && [ -n "$_ts2" ] && TANG_SERVERS[1]="$_ts2"
+        _read_offline_conf "$_bkp_conf"
         if [ -n "$PI_DEVICE" ]; then
           ok "Read device info from backup luks.conf: $PI_DEVICE (board: ${BOARD_TYPE:-unknown})"
         fi
@@ -881,9 +1386,9 @@ if [ -z "$PI_DEVICE" ] || [ -z "$PI_BOOT_PART" ] || [ -z "$PI_ROOT_PART" ]; then
   fi
 
   if [ -z "$PI_DEVICE" ] || [ -z "$PI_BOOT_PART" ] || [ -z "$PI_ROOT_PART" ]; then
-    info "No luks.conf found — asking for internal device path."
+    info "No luks.conf found - asking for internal device path."
     info "This is how the target system sees its own storage."
-    read -rp "Enter the INTERNAL device path [/dev/mmcblk0]: " PI_DEVICE
+    _ask_value PI_DEVICE "Enter the INTERNAL device path [/dev/mmcblk0]: " "a luks.conf from luks_prepare.sh on the target root"
     PI_DEVICE="${PI_DEVICE:-/dev/mmcblk0}"
 
     if [[ "$PI_DEVICE" == *nvme* ]] || [[ "$PI_DEVICE" == *mmcblk* ]]; then
@@ -896,7 +1401,13 @@ if [ -z "$PI_DEVICE" ] || [ -z "$PI_BOOT_PART" ] || [ -z "$PI_ROOT_PART" ]; then
   fi
 fi
 
-# Migrate scenarios run on the board itself — treat as local mode
+# rpi_offline: Raspberry Pi card, never booted (external mode, like rpi)
+_normalize_offline_state
+if [ "$SCENARIO" = "rpi_offline" ]; then
+  info "Offline scenario: the card has never been booted (first boot pending: ${FIRST_BOOT_PENDING})"
+fi
+
+# Migrate scenarios run on the board itself - treat as local mode
 if [ "$LOCAL_MODE" = false ]; then
   if [ "$SCENARIO" = "nvme_migrate" ] || [ "$SCENARIO" = "usb_migrate" ]; then
     LOCAL_MODE=true
@@ -907,7 +1418,7 @@ fi
 # --- Prompt for empty tang servers (after luks.conf may have filled them) ---
 for i in "${!TANG_SERVERS[@]}"; do
   if [ -z "${TANG_SERVERS[$i]}" ]; then
-    read -rp "Tang server $((i+1)) URL (e.g. http://tang.example.com): " url
+    _ask_value url "Tang server $((i+1)) URL (e.g. http://tang.example.com): " "--tang=<url1>,<url2>"
     if [ -z "$url" ]; then
       fail "Tang server $((i+1)) must not be empty."
     fi
@@ -967,17 +1478,27 @@ if [ "$SCENARIO" != "nvme_migrate" ] && [ "$SCENARIO" != "usb_migrate" ]; then
     rmdir "$_size_probe" 2>/dev/null || true
   fi
 
-  TMPDIR_AVAIL_KB=$(df --output=avail /tmp 2>/dev/null | tail -1 | tr -d ' ')
-  info "Available space in /tmp: ~$((TMPDIR_AVAIL_KB / 1024)) MB"
-
-  if [ "$TMPDIR_AVAIL_KB" -lt "$NEEDED_KB" ]; then
-    warn "Insufficient space in /tmp for backup!"
-    read -rp "Enter an alternative backup directory with enough space: " BACKUP_BASE
-    if [ ! -d "$BACKUP_BASE" ]; then
-      fail "Directory $BACKUP_BASE does not exist"
-    fi
+  if [ -n "$BACKUP_DIR_OVERRIDE" ] && [ "$START_PHASE_NUM" -gt 2 ]; then
+    # Resume: --backup-dir is the existing backup, nothing to size or ask
+    BACKUP_BASE="$BACKUP_DIR_OVERRIDE"
   else
-    BACKUP_BASE="/tmp"
+    # Fresh run: --backup-dir, if given, is where the backup is created
+    _backup_root="${BACKUP_DIR_OVERRIDE:-/tmp}"
+    TMPDIR_AVAIL_KB=$(df --output=avail "$_backup_root" 2>/dev/null | tail -1 | tr -d ' ')
+    info "Available space in ${_backup_root}: ~$((TMPDIR_AVAIL_KB / 1024)) MB"
+
+    if [ "$TMPDIR_AVAIL_KB" -lt "$NEEDED_KB" ]; then
+      warn "Insufficient space in ${_backup_root} for backup!"
+      if [ -n "$BACKUP_DIR_OVERRIDE" ]; then
+        fail "--backup-dir=${BACKUP_DIR_OVERRIDE} has too little space (~$((TMPDIR_AVAIL_KB / 1024)) MB free, ~$((NEEDED_KB / 1024)) MB needed). Pass a larger directory with --backup-dir=."
+      fi
+      _ask_value BACKUP_BASE "Enter an alternative backup directory with enough space: " "--backup-dir=<dir>"
+      if [ ! -d "$BACKUP_BASE" ]; then
+        fail "Directory $BACKUP_BASE does not exist"
+      fi
+    else
+      BACKUP_BASE="$_backup_root"
+    fi
   fi
 else
   info "Migration scenario: copying directly from live root (no backup needed)"
@@ -999,18 +1520,47 @@ if [ "$USE_LVM" = true ]; then
 echo "  LVM:                   enabled (VG: $LVM_VG_NAME, LV: $LVM_LV_NAME, size: ${LVM_ROOT_SIZE:-100%FREE})"
 fi
 echo "  Root device:           $ROOT_DEV"
+if _first_boot_pending; then
+echo "  First boot pending:    yes (first-boot state is protected and verified)"
+fi
+if [ -n "$NET_DRIVERS" ]; then
+echo "  Initramfs NIC modules: $NET_DRIVERS (checked in every initramfs)"
+fi
 if [ -n "$BACKUP_BASE" ]; then
   echo "  Backup location:       $BACKUP_BASE"
 fi
 echo ""
+# Without a terminal, find out now (before the long backup) which questions
+# would be left, instead of failing at the end of the run
+if [ ! -t 0 ]; then
+  if [ -z "$PASSPHRASE_FILE" ] && [ "$START_PHASE_NUM" -le 7 ]; then
+    fail "A LUKS passphrase is needed but stdin is not a terminal. Use --passphrase-file=<file>."
+  fi
+  if [ "$SCENARIO" != "nvme_migrate" ] && [ "$SCENARIO" != "usb_migrate" ] \
+     && [ "$KEEP_BACKUP" != true ] && [ "$REMOVE_BACKUP" != true ]; then
+    fail "The final 'remove the backup?' question cannot be asked: stdin is not a terminal. Use --keep-backup or --remove-backup."
+  fi
+  if { [ "$SCENARIO" = "nvme_migrate" ] || [ "$SCENARIO" = "usb_migrate" ]; } && [ "$BOARD_TYPE" = "armbian" ] \
+     && [ "$YES_MODE" != true ]; then
+    fail "The SPI flash question cannot be asked: stdin is not a terminal. Use --yes (answers it with no)."
+  fi
+fi
+if [ -n "$OFFLINE_HOST_DEVICE" ]; then
+  # Hint only: the device path on the host changes between runs and ports
+  if [ "$OFFLINE_HOST_DEVICE" = "$EXT_DEVICE" ]; then
+    info "luks.conf: this card was prepared as $OFFLINE_HOST_DEVICE (same as the selected device)"
+  else
+    info "luks.conf: this card was prepared as $OFFLINE_HOST_DEVICE on the host; you selected $EXT_DEVICE."
+    info "Device names change between runs, so compare model and size above with the card you prepared."
+  fi
+  echo ""
+fi
 if [ "$START_PHASE_NUM" -gt 1 ]; then
   echo -e "${YELLOW}Resuming from phase ${START_PHASE_NUM} (${PHASE_NAMES[$((START_PHASE_NUM-1))]})${NC}"
-  read -rp "Continue? [y/N] " CONFIRM
-  [[ "$CONFIRM" == [yY] ]] || { echo "Aborted."; exit 0; }
+  _ask_confirm "Continue? [y/N] " "--yes" yes || { echo "Aborted."; exit 0; }
 else
   echo -e "${RED}WARNING: This will ENCRYPT $EXT_ROOT_PART. Data will be backed up first.${NC}"
-  read -rp "Type 'YES' to proceed: " CONFIRM
-  [ "$CONFIRM" = "YES" ] || { echo "Aborted."; exit 0; }
+  _ask_confirm "Type 'YES' to proceed: " "--yes" yes YES || { echo "Aborted."; exit 0; }
 fi
 
 # =====================================================================
@@ -1035,7 +1585,7 @@ if [ "$LOCAL_MODE" = true ]; then
   # Local mode: backup from live root filesystem
   info "Backing up live root filesystem to $BACKUP_DIR..."
   info "This may take a while depending on filesystem size..."
-  # rsync exit code 23 = partial transfer (e.g. xattr not supported on tmpfs) — tolerable
+  # rsync exit code 23 = partial transfer (e.g. xattr not supported on tmpfs) - tolerable
   rsync -aHAXx --info=progress2 \
     --exclude='/dev/*' --exclude='/proc/*' \
     --exclude='/sys/*' --exclude='/tmp/*' --exclude='/run/*' \
@@ -1089,7 +1639,7 @@ fi  # end phase gate: backup
 
 if [ "$START_PHASE_NUM" -le 3 ]; then
 
-# When resuming at encrypt phase, backup was already done — locate it now
+# When resuming at encrypt phase, backup was already done - locate it now
 if [ "$START_PHASE_NUM" -eq 3 ]; then
   _find_backup_dir
 fi
@@ -1097,23 +1647,25 @@ fi
 echo ""
 info "=== Phase 2: LUKS Encryption ==="
 
-# Get LUKS passphrase
-while true; do
-  read -rsp "Enter LUKS passphrase (this is the fallback password): " LUKS_PASS
-  echo ""
-  read -rsp "Confirm LUKS passphrase: " LUKS_PASS2
-  echo ""
-  if [ "$LUKS_PASS" = "$LUKS_PASS2" ]; then
-    if [ ${#LUKS_PASS} -lt $MIN_PASSPHRASE_LEN ]; then
-      warn "Passphrase is very short. Use at least 8 characters."
-      read -rp "Use this passphrase anyway? [y/N] " CONFIRM
-      [[ "$CONFIRM" == [yY] ]] || continue
+# Get LUKS passphrase (--passphrase-file: already loaded and checked at startup)
+if [ -n "$PASSPHRASE_FILE" ]; then
+  info "Using the LUKS passphrase from $PASSPHRASE_FILE"
+else
+  while true; do
+    _ask_value LUKS_PASS "Enter LUKS passphrase (this is the fallback password): " "--passphrase-file=<file>" secret
+    _ask_value LUKS_PASS2 "Confirm LUKS passphrase: " "--passphrase-file=<file>" secret
+    if [ "$LUKS_PASS" = "$LUKS_PASS2" ]; then
+      if [ ${#LUKS_PASS} -lt $MIN_PASSPHRASE_LEN ]; then
+        warn "Passphrase is very short. Use at least 8 characters."
+        # --yes does not skip this one
+        _ask_confirm "Use this passphrase anyway? [y/N] " "a passphrase of at least ${MIN_PASSPHRASE_LEN} characters" ask || continue
+      fi
+      break
+    else
+      warn "Passphrases do not match. Try again."
     fi
-    break
-  else
-    warn "Passphrases do not match. Try again."
-  fi
-done
+  done
+fi
 
 # Close stale LVM/LUKS stack from a previous failed run, if any
 if [ -b "/dev/mapper/${LVM_VG_NAME}-${LVM_LV_NAME}" ]; then
@@ -1131,7 +1683,7 @@ wipefs --all --force "$EXT_ROOT_PART" 2>/dev/null || true
 dd if=/dev/zero of="$EXT_ROOT_PART" bs=1M count=16 conv=notrunc 2>/dev/null || true
 
 info "Encrypting $EXT_ROOT_PART with LUKS2..."
-echo -n "$LUKS_PASS" | cryptsetup luksFormat --type luks2 --batch-mode "$EXT_ROOT_PART" -
+printf '%s' "$LUKS_PASS" | cryptsetup luksFormat --type luks2 --batch-mode "$EXT_ROOT_PART" -
 
 info "Opening LUKS device..."
 # Close stale mapper device from a previous failed run, if any
@@ -1139,7 +1691,7 @@ if [ -b "/dev/mapper/$LUKS_MAPPER_NAME" ]; then
   warn "Closing stale /dev/mapper/$LUKS_MAPPER_NAME from previous run..."
   cryptsetup luksClose "$LUKS_MAPPER_NAME" 2>/dev/null || true
 fi
-echo -n "$LUKS_PASS" | cryptsetup luksOpen "$EXT_ROOT_PART" "$LUKS_MAPPER_NAME" -
+printf '%s' "$LUKS_PASS" | cryptsetup luksOpen "$EXT_ROOT_PART" "$LUKS_MAPPER_NAME" -
 CLEANUP_LUKS="$LUKS_MAPPER_NAME"
 
 ok "LUKS encryption complete"
@@ -1255,6 +1807,7 @@ echo ""
 info "=== Phase 4: Boot Configuration ==="
 
 STAGED="${MOUNT_DST}/root/luks-staged"
+_load_offline_state_from_root
 
 if [ ! -d "$STAGED" ]; then
   fail "Staged directory not found at $STAGED"
@@ -1268,10 +1821,19 @@ CLEANUP_MOUNTS+=("$MOUNT_BOOT")
 
 # --- Board-specific boot config ---
 
-if [ "$BOARD_TYPE" = "rpi" ]; then
+if _is_rpi; then
   # RPi: update cmdline.txt
   if [ -f "$MOUNT_BOOT/cmdline.txt" ]; then
     CURRENT_CMDLINE=$(cat "$MOUNT_BOOT/cmdline.txt")
+    CMDLINE_ORIGINAL="$CURRENT_CMDLINE"
+    if _first_boot_pending && [ -f "${STAGED}/cmdline.txt" ]; then
+      # Offline card: luks_prepare.sh staged the cmdline.txt with the new disk ID
+      # and without ' resize'. It is the base; only root= and cryptdevice= are
+      # replaced below, everything else (ds=nocloud;i=...) is kept as is.
+      CURRENT_CMDLINE=$(cat "${STAGED}/cmdline.txt")
+      CMDLINE_ORIGINAL="${CMDLINE_ORIGINAL} ${CURRENT_CMDLINE}"
+      info "Offline card: using the staged cmdline.txt as base"
+    fi
     NEW_CMDLINE=$(echo "$CURRENT_CMDLINE" | sed \
       -e 's|root=[^ ]*||g' \
       -e 's|cryptdevice=[^ ]*||g' \
@@ -1279,10 +1841,13 @@ if [ "$BOARD_TYPE" = "rpi" ]; then
       -e 's|^ ||' \
       -e 's| $||')
     NEW_CMDLINE="${NEW_CMDLINE} root=${ROOT_DEV} cryptdevice=UUID=${LUKS_UUID}:${LUKS_MAPPER_NAME}"
+    # Checked before anything is written: the card's cmdline.txt stays untouched on failure
+    _check_cmdline_first_boot "$NEW_CMDLINE" "$CMDLINE_ORIGINAL"
     echo "$NEW_CMDLINE" > "$MOUNT_BOOT/cmdline.txt"
     info "Updated cmdline.txt:"
     echo -e "  ${CYAN}$(cat "$MOUNT_BOOT/cmdline.txt")${NC}"
   else
+    _check_cmdline_first_boot "$(cat "${STAGED}/cmdline.txt")" "$(cat "${STAGED}/cmdline.txt")"
     cp "${STAGED}/cmdline.txt" "$MOUNT_BOOT/cmdline.txt"
     info "Installed staged cmdline.txt"
   fi
@@ -1328,7 +1893,7 @@ if [ -f "${MOUNT_DST}/etc/fstab" ]; then
   fi
 
   # Update boot partition mount
-  if [ "$BOARD_TYPE" = "rpi" ]; then
+  if _is_rpi; then
     sed -i -E "s|^[^ ]+(\s+/boot/firmware\s+)|${PI_BOOT_PART}\1|" "${MOUNT_DST}/etc/fstab"
   elif [ "$BOARD_TYPE" = "armbian" ]; then
     BOOT_UUID=$(blkid -s UUID -o value "$EXT_BOOT_PART")
@@ -1378,10 +1943,25 @@ if [ "$START_PHASE_NUM" -eq 6 ]; then
   _ensure_luks_open
   _ensure_root_mounted
   _ensure_boot_mounted
+  _load_offline_state_from_root
 fi
 
 echo ""
 info "=== Phase 5: Initramfs Rebuild (chroot) ==="
+
+RESUME_HINT="sudo ./luks_encrypt.sh --start-phase=initramfs${BACKUP_DIR:+ --backup-dir=$BACKUP_DIR}"
+
+# Offline card: the root must still be in its never-booted state before the
+# chroot is used (else nothing below can restore a state that is already gone)
+if _first_boot_pending; then
+  _pre_findings=$(_never_booted_findings root)
+  if [ -n "$_pre_findings" ]; then
+    while IFS= read -r _l; do warn "$_l"; done <<<"$_pre_findings"
+    fail "The root is not in its never-booted state (see above): the first boot of this card would not behave as on a fresh image.
+       Re-image the card and run luks_prepare.sh --offline again; remove leftovers of a failed run only if you are sure of what they are."
+  fi
+  ok "Root is in its never-booted state"
+fi
 
 # Bind-mount required filesystems for chroot
 mount --bind /dev "${MOUNT_DST}/dev"
@@ -1394,7 +1974,7 @@ mount -t sysfs sys "${MOUNT_DST}/sys"
 CLEANUP_MOUNTS+=("${MOUNT_DST}/sys")
 
 # Bind-mount boot partition into chroot at the correct path
-if [ "$BOARD_TYPE" = "rpi" ]; then
+if _is_rpi; then
   CHROOT_BOOT_MOUNT="${MOUNT_DST}/boot/firmware"
 else
   CHROOT_BOOT_MOUNT="${MOUNT_DST}/boot"
@@ -1402,6 +1982,11 @@ fi
 mkdir -p "$CHROOT_BOOT_MOUNT"
 mount --bind "$MOUNT_BOOT" "$CHROOT_BOOT_MOUNT"
 CLEANUP_MOUNTS+=("$CHROOT_BOOT_MOUNT")
+
+# Save what the chroot may change (machine-id, policy-rc.d, qemu copy, SSH host
+# keys) BEFORE the first chroot command; _fb_restore undoes it afterwards and
+# from the EXIT trap on every failure path.
+_fb_arm
 
 # For aarch64 target, we may need qemu-user-static for cross-arch chroot
 if [ "$(uname -m)" != "aarch64" ]; then
@@ -1417,8 +2002,6 @@ if [ "$(uname -m)" != "aarch64" ]; then
     warn "Install qemu-user-static or qemu-user if chroot fails."
   fi
 fi
-
-RESUME_HINT="sudo ./luks_encrypt.sh --start-phase=initramfs${BACKUP_DIR:+ --backup-dir=$BACKUP_DIR}"
 
 # Checksums before the rebuild, to prove afterwards that every image changed
 INITRAMFS_PRE_SUMS=$(_initramfs_images | xargs -r -d '\n' sha256sum)
@@ -1460,6 +2043,25 @@ fi
 INITRAMFS_VERIFIED=true
 ok "Initramfs rebuilt"
 
+# The chroot is done (the verification above may still have used its qemu copy):
+# remove the leftovers and restore the first-boot state. Runs in every scenario
+# (the qemu copy is a leftover everywhere); the cloud-init and SSH key checks
+# only apply to a never-booted card.
+if ! _fb_restore; then
+  fail "The chroot leftovers / first-boot state could not be restored completely (see warnings above).
+       Do not boot this card. Fix the cause, then resume with: ${RESUME_HINT}"
+fi
+if _first_boot_pending; then
+  _post_findings=$(_never_booted_findings root)
+  if [ -n "$_post_findings" ]; then
+    while IFS= read -r _l; do warn "$_l"; done <<<"$_post_findings"
+    fail "The rebuild changed the never-booted state of the root (see above): the first boot would not behave as on a fresh image.
+       Do not boot this card. Re-image it and start over."
+  fi
+  ok "First-boot state intact (machine-id, no SSH host keys, no cloud-init instance, no policy-rc.d, no qemu copy)"
+fi
+_check_target_health "Phase 5 (first-boot state)"
+
 # Unmount chroot bind mounts (in reverse order)
 for mnt in "$CHROOT_BOOT_MOUNT" "${MOUNT_DST}/sys" "${MOUNT_DST}/proc" "${MOUNT_DST}/dev/pts" "${MOUNT_DST}/dev"; do
   if mountpoint -q "$mnt" 2>/dev/null; then
@@ -1479,8 +2081,7 @@ if [ "$START_PHASE_NUM" -le 7 ]; then
 
 # If resuming at clevis, we need the LUKS passphrase for binding
 if [ -z "$LUKS_PASS" ]; then
-  read -rsp "Enter LUKS passphrase (for clevis binding): " LUKS_PASS
-  echo ""
+  _ask_value LUKS_PASS "Enter LUKS passphrase (for clevis binding): " "--passphrase-file=<file>" secret
 fi
 
 echo ""
@@ -1522,7 +2123,7 @@ else
 
   info "Binding clevis/tang to $EXT_ROOT_PART..."
   KEYFILE=$(mktemp)
-  echo -n "$LUKS_PASS" > "$KEYFILE"
+  printf '%s' "$LUKS_PASS" > "$KEYFILE"
   chmod 600 "$KEYFILE"
 
   if clevis luks bind -k "$KEYFILE" -d "$EXT_ROOT_PART" sss "$CONFIG"; then
@@ -1550,6 +2151,14 @@ info "=== Verification ==="
 info "Clevis bindings on $EXT_ROOT_PART:"
 clevis luks list -d "$EXT_ROOT_PART" 2>/dev/null || echo "  (none)"
 
+# Resumed after the initramfs phase on a never-booted card: the root and boot
+# partition are needed for the checks below
+if { _first_boot_pending || [ -n "$NET_DRIVERS" ]; } && [ "$START_PHASE_NUM" -ge 7 ]; then
+  _ensure_luks_open
+  _ensure_root_mounted
+  _ensure_boot_mounted
+fi
+
 # Verify every initramfs image can unlock the encrypted root
 if [ "$INITRAMFS_VERIFIED" = true ]; then
   info "Initramfs images already verified in phase 5"
@@ -1560,6 +2169,23 @@ elif [ -n "$MOUNT_BOOT" ] && mountpoint -q "$MOUNT_BOOT" 2>/dev/null; then
   fi
 else
   fail "Boot partition not mounted, cannot verify the initramfs images."
+fi
+
+# Never-booted card (offline mode): the image must look exactly as the Imager
+# wrote it, so the first boot on the Pi runs the full first-boot logic
+if _first_boot_pending; then
+  info "Verifying the never-booted state of the card..."
+  if [ -z "$MOUNT_DST" ] || ! mountpoint -q "$MOUNT_DST" 2>/dev/null \
+     || [ -z "$MOUNT_BOOT" ] || ! mountpoint -q "$MOUNT_BOOT" 2>/dev/null; then
+    fail "Root or boot partition not mounted, cannot verify the never-booted state."
+  fi
+  _nb_findings=$(_never_booted_findings full)
+  if [ -n "$_nb_findings" ]; then
+    while IFS= read -r _l; do warn "$_l"; done <<<"$_nb_findings"
+    fail "The card is no longer in its never-booted state (see above): its first boot would not work as on a fresh image.
+       Do not boot this card."
+  fi
+  ok "Never-booted state verified (machine-id, SSH keys, cloud-init, seed files, cmdline.txt, no leftovers)"
 fi
 
 _check_target_health "Verification"
@@ -1622,6 +2248,9 @@ if { [ "$SCENARIO" = "nvme_migrate" ] || [ "$SCENARIO" = "usb_migrate" ]; } && [
         warn "No U-Boot SPI images found in /usr/lib/linux-u-boot-*/"
         warn "Install the appropriate u-boot package for your board, then flash manually:"
         warn "  dd if=<spi-image> of=/dev/mtdblock0 conv=notrunc status=progress"
+      elif [ "$YES_MODE" = true ]; then
+        info "--yes answers the SPI flash question with no: nothing flashed."
+        info "Flash later, e.g.: dd if=${SPI_IMAGES[0]} of=/dev/mtdblock0 conv=notrunc status=progress"
       else
         echo ""
         info "Found U-Boot SPI image(s):"
@@ -1637,7 +2266,7 @@ if { [ "$SCENARIO" = "nvme_migrate" ] || [ "$SCENARIO" = "usb_migrate" ]; } && [
         else
           echo ""
           while true; do
-            read -rp "Select image number [1-${#SPI_IMAGES[@]}]: " IMG_NUM
+            _ask_value IMG_NUM "Select image number [1-${#SPI_IMAGES[@]}]: " "--yes (skips the SPI flash)"
             if [[ "$IMG_NUM" =~ ^[0-9]+$ ]] && [ "$IMG_NUM" -ge 1 ] && [ "$IMG_NUM" -le ${#SPI_IMAGES[@]} ]; then
               SPI_IMAGE="${SPI_IMAGES[$((IMG_NUM-1))]}"
               break
@@ -1651,12 +2280,10 @@ if { [ "$SCENARIO" = "nvme_migrate" ] || [ "$SCENARIO" = "usb_migrate" ]; } && [
           warn "SPI flash already contains a bootloader. This will overwrite it."
         fi
         info "Image: $SPI_IMAGE"
-        read -rp "Write U-Boot to SPI flash for ${STORAGE_TYPE} boot? [y/N] " FLASH_CONFIRM
-
-        if [[ "$FLASH_CONFIRM" == [yY] ]]; then
+        if _ask_confirm "Write U-Boot to SPI flash for ${STORAGE_TYPE} boot? [y/N] " "--yes (skips the SPI flash)" no; then
           MTD_SIZE=$(cat /sys/class/mtd/mtd0/size 2>/dev/null || echo "")
           if [ -z "$MTD_SIZE" ] || [ "$MTD_SIZE" -eq 0 ]; then
-            warn "Cannot determine SPI flash size — skipping erase+write"
+            warn "Cannot determine SPI flash size - skipping erase+write"
           else
             MTD_BLOCKS=$((MTD_SIZE / 4096))
             info "SPI flash size: $((MTD_SIZE / 1024)) KB ($MTD_BLOCKS blocks)"
@@ -1676,10 +2303,10 @@ if { [ "$SCENARIO" = "nvme_migrate" ] || [ "$SCENARIO" = "usb_migrate" ]; } && [
             # Verify: read back first 512 bytes and check non-zero
             VERIFY_DATA=$(dd if=/dev/mtdblock0 bs=512 count=1 2>/dev/null | od -A n -t x1 | tr -d ' \n')
             if [ -n "$(echo "$VERIFY_DATA" | tr -d '0')" ]; then
-              ok "SPI flash verified — U-Boot written successfully"
+              ok "SPI flash verified - U-Boot written successfully"
               SPI_FLASHED=true
             else
-              warn "SPI flash verification failed — data appears empty after write"
+              warn "SPI flash verification failed - data appears empty after write"
               warn "You may need to flash manually after reboot"
             fi
           fi
@@ -1694,7 +2321,7 @@ if { [ "$SCENARIO" = "nvme_migrate" ] || [ "$SCENARIO" = "usb_migrate" ]; } && [
       warn "Try: modprobe spi-rockchip-sfc"
     fi
   else
-    info "Not an RK3588 board — skipping SPI flash step"
+    info "Not an RK3588 board - skipping SPI flash step"
   fi
 fi
 
@@ -1704,8 +2331,16 @@ if [ -n "$BACKUP_DIR" ] && [ -d "$BACKUP_DIR" ]; then
   _check_target_health "Before removing the backup"
   echo ""
   info "Keep the backup until the device has booted from the encrypted root."
-  read -rp "Remove backup directory $BACKUP_DIR now? [y/N] " RM_BACKUP
-  if [[ "$RM_BACKUP" == [yY] ]]; then
+  RM_BACKUP_NOW=false
+  if [ "$REMOVE_BACKUP" = true ]; then
+    info "--remove-backup: removing $BACKUP_DIR"
+    RM_BACKUP_NOW=true
+  elif [ "$KEEP_BACKUP" = true ]; then
+    info "--keep-backup: keeping $BACKUP_DIR"
+  elif _ask_confirm "Remove backup directory $BACKUP_DIR now? [y/N] " "--keep-backup or --remove-backup" ask; then
+    RM_BACKUP_NOW=true
+  fi
+  if [ "$RM_BACKUP_NOW" = true ]; then
     rm -rf "$BACKUP_DIR"
     BACKUP_DIR_FOR_CLEANUP=""
     ok "Backup removed"
@@ -1728,7 +2363,15 @@ fi
 echo "================================================================="
 echo ""
 
-if [ "$BOARD_TYPE" = "rpi" ]; then
+if [ "$SCENARIO" = "rpi_offline" ]; then
+  echo -e "${YELLOW}Next steps:${NC}"
+  echo "  1. Put the card into the Raspberry Pi (it has never been booted)"
+  echo "  2. Connect the Ethernet cable (tang servers must be reachable)"
+  echo "  3. Power on: the initramfs brings up the network, clevis unlocks the root via tang"
+  echo "  4. Then the normal first boot runs: resize services, SSH host keys, cloud-init"
+  echo "     (user, hostname, SSH keys, Wi-Fi from the seed on the boot partition)"
+
+elif _is_rpi; then
   echo -e "${YELLOW}Next steps:${NC}"
   echo "  1. Insert the SD card / NVMe back into the Raspberry Pi"
   echo "  2. Connect the Pi to the network (tang servers must be reachable)"
@@ -1781,3 +2424,15 @@ echo ""
 echo "  If clevis was not bound (tang unreachable), bind with:"
 echo "    sudo /root/setup_clevis_tang.sh"
 echo ""
+if [ "$SCENARIO" = "rpi_offline" ]; then
+echo "  Fully non-interactive run for the next card:"
+echo "    sudo ./luks_encrypt.sh --device=/dev/sdX --yes --passphrase-file=/path/to/pass --tang=http://a,http://b --keep-backup"
+echo ""
+echo "  After the first boot (offline card), also check:"
+echo "    cloud-init status --long             # status: done, no errors"
+echo "    cat /etc/machine-id                  # a real ID now"
+echo "    ls /etc/ssh/ssh_host_*               # host keys exist"
+echo "    lsblk; lvs                           # ${PI_ROOT_PART} over the whole card, ${LVM_VG_NAME}/${LVM_LV_NAME} full size"
+echo "    grep -c ' resize' /proc/cmdline      # 0"
+echo ""
+fi
