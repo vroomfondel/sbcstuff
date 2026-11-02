@@ -1156,8 +1156,8 @@ ADEOF
           umount "$mnt" 2>/dev/null || umount -l "$mnt" 2>/dev/null || true
         done
 
-        # Re-exec from /tmp
-        exec env _LUKS_REEXEC=1 "$TMPSCRIPT"
+        # Re-exec from /tmp, keeping the command line (--yes, --passphrase-file, --usb-key-file, ...)
+        exec env _LUKS_REEXEC=1 "$TMPSCRIPT" "$@"
       fi
     fi
   fi
