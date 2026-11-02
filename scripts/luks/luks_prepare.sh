@@ -19,6 +19,7 @@
 #        sudo ./luks_prepare.sh --usb-key [--usb-key-host=<name>]   # plus the USB stick fallback
 
 set -euo pipefail
+umask 022   # files written into the system or the card get standard modes, whatever the calling shell has set
 
 # --- Configuration ---
 TANG_SERVERS=("" "")
@@ -1650,11 +1651,13 @@ _offline_chroot_prepare() {
   local q QEMU_BIN=""
 
   # Temporary resolver for apt. The saved original is put back by the restore phase.
+  # Mode 644 is essential: apt fetches as the user _apt, and an unreadable resolv.conf shows up
+  # as "Temporary failure resolving". The resolver is verified inside the chroot further below.
   rm -f "$TARGET_ROOT/etc/resolv.conf"
   if [ -s /etc/resolv.conf ]; then
-    cp -L /etc/resolv.conf "$TARGET_ROOT/etc/resolv.conf"
+    install -m 644 /etc/resolv.conf "$TARGET_ROOT/etc/resolv.conf"
   elif [ -s /run/systemd/resolve/resolv.conf ]; then
-    cp -L /run/systemd/resolve/resolv.conf "$TARGET_ROOT/etc/resolv.conf"
+    install -m 644 /run/systemd/resolve/resolv.conf "$TARGET_ROOT/etc/resolv.conf"
   else
     fail "The host has no usable /etc/resolv.conf, apt in the chroot could not resolve names"
   fi
@@ -1684,7 +1687,36 @@ _offline_chroot_prepare() {
   if ! _in_target /bin/true; then
     fail "A test command does not run inside the aarch64 chroot (check qemu-user-static and binfmt_misc)"
   fi
+  _offline_verify_resolver
   ok "Chroot ready"
+}
+
+# Name resolution must work inside the chroot before apt runs. The host copy is tried first
+# (a 127.0.0.53 stub works in a chroot, the network namespace is shared), then the upstream
+# servers systemd-resolved knows, then public resolvers. Fails if nothing resolves.
+_offline_verify_resolver() {
+  local probe="deb.debian.org" src
+  if _in_target getent hosts "$probe" >/dev/null 2>&1; then
+    info "  Resolver in the chroot works ($(grep -c '^nameserver' "$TARGET_ROOT/etc/resolv.conf" || true) nameserver(s) from the host)"
+    return 0
+  fi
+  warn "The host's resolv.conf does not resolve ${probe} inside the chroot, trying the upstream servers of systemd-resolved"
+  src=/run/systemd/resolve/resolv.conf
+  if [ -s "$src" ] && grep -q '^nameserver' "$src"; then
+    install -m 644 "$src" "$TARGET_ROOT/etc/resolv.conf"
+    if _in_target getent hosts "$probe" >/dev/null 2>&1; then
+      info "  Resolver in the chroot works (upstream servers from ${src})"
+      return 0
+    fi
+  fi
+  warn "Still no resolution, falling back to public resolvers (9.9.9.9, 1.1.1.1) for the chroot"
+  printf 'nameserver 9.9.9.9\nnameserver 1.1.1.1\n' > "$TARGET_ROOT/etc/resolv.conf"
+  chmod 644 "$TARGET_ROOT/etc/resolv.conf"
+  if _in_target getent hosts "$probe" >/dev/null 2>&1; then
+    info "  Resolver in the chroot works (public resolvers)"
+    return 0
+  fi
+  fail "No name resolution inside the chroot (host resolv.conf, systemd-resolved upstream and public resolvers all fail): check the network of this host"
 }
 
 # --- Target storage health (card reader resets, I/O errors) ---

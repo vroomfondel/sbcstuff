@@ -26,6 +26,7 @@
 #             --tang=http://a,http://b --keep-backup
 
 set -euo pipefail
+umask 022   # files written into the target get standard modes, whatever the calling shell has set
 
 # --- Parse flags ---
 SPI_ONLY=false
