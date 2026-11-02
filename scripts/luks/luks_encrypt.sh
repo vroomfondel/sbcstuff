@@ -14,6 +14,7 @@
 #
 # Usage: sudo ./luks_encrypt.sh
 #        sudo ./luks_encrypt.sh --device=/dev/sdX   # Skip the device prompt (confirmation stays)
+#        sudo ./luks_encrypt.sh --usb-key-file=/path/to/usb.key   # Plus a USB stick keyslot (needs luks_prepare.sh --usb-key)
 #        sudo ./luks_encrypt.sh --lv-size=50G   # Set root LV size (default: 100%FREE)
 #        sudo ./luks_encrypt.sh --spi-only       # Flash U-Boot to SPI only (skip encryption)
 #        sudo ./luks_encrypt.sh --start-phase=clevis
@@ -37,11 +38,20 @@ TANG_ARG=""                       # --tang=<url1>,<url2>: tang servers (override
 KEEP_BACKUP=false                 # --keep-backup: keep the backup directory, do not ask
 REMOVE_BACKUP=false               # --remove-backup: remove the backup directory, do not ask
 DEVICE_ARG=""                     # --device=<dev>: target device, skips the interactive prompt
+USB_KEY_FILE=""                   # --usb-key-file=<path>: key for the USB stick keyslot (created if missing)
 ALLOW_LOOP=false                  # --allow-loop: accept /dev/loopN as target (test only)
 # Offline mode state, filled from luks.conf (see _read_offline_conf)
 FIRST_BOOT_PENDING=""             # "yes": the card was never booted (rpi_offline)
 NET_DRIVERS=""                    # space separated NIC modules the initramfs must contain
 OFFLINE_HOST_DEVICE=""            # host device the card was prepared on (hint only)
+# USB key state, filled from luks.conf (see _read_offline_conf) and the key file
+USB_KEY=""                        # "yes": luks_prepare.sh --usb-key installed the initramfs fallback
+USB_KEY_LABEL=""                  # filesystem label of the stick (luks.conf)
+USB_KEY_HOST=""                   # host name that names luks-keys/<host>.key (luks.conf)
+USB_KEY_VALUE=""                  # the key: first line of --usb-key-file
+USB_KEY_ROOT_PATH="/etc/clevis-keyfile/fallback.key"  # master copy on the encrypted root (read by clevis_keyfile_write_usb.sh)
+USB_KEY_WARNED=false              # the "no USB_KEY in luks.conf" warning was shown
+LUKS_CONF_READ=false              # a luks.conf was read (the USB_KEY values are known)
 for arg in "$@"; do
   case "$arg" in
     -h|--help)
@@ -75,6 +85,22 @@ for arg in "$@"; do
       echo "                         never changed or deleted. Fails if missing, empty or shorter than ${MIN_PASSPHRASE_LEN:-8}"
       echo "                         characters (no 'use anyway?' question)"
       echo "  --tang=URL1,URL2       Exactly two tang servers (SSS threshold 2), override script and luks.conf"
+      echo "  --usb-key-file=PATH    Add a USB stick key as a further keyslot (needs luks_prepare.sh --usb-key,"
+      echo "                         which installs the initramfs fallback and writes USB_KEY=\"yes\" to luks.conf;"
+      echo "                         then this option is REQUIRED and the run fails early without it). If PATH is a"
+      echo "                         directory (the mounted stick), the key is <dir>/luks-keys/<host>.key with <host> ="
+      echo "                         USB_KEY_HOST from luks.conf (luks-keys/ is created, the label is checked). If the"
+      echo "                         file does not exist, 48 random bytes are generated as one base64 line of 64 characters"
+      echo "                         (mode 600, never overwritten). If it exists, its first line is the key (the file"
+      echo "                         is only read, never changed or deleted). The key is stored without trailing"
+      echo "                         newline as /etc/clevis-keyfile/fallback.key on the encrypted root and added with"
+      echo "                         cryptsetup luksAddKey (authorised by the passphrase); the run then proves that the"
+      echo "                         key unlocks and that the keyslot count rose. Works with --start-phase=clevis|verify."
+      echo "                         The stick: any filesystem (vfat, exfat, ext4), label LUKSKEY (mkfs.vfat -n LUKSKEY"
+      echo "                         /dev/sdY1, or e2label), with the key as luks-keys/<hostname>.key (or luks-fallback.key"
+      echo "                         in its root), see the next steps printed at the end. At boot the initramfs offers"
+      echo "                         tang, the stick and the typed passphrase in parallel, the first valid answer wins;"
+      echo "                         stick plus card unlock the system without tang or passphrase"
       echo "  --keep-backup          Keep the backup directory at the end without asking"
       echo "  --remove-backup        Remove the backup directory at the end without asking"
       echo "                         (mutually exclusive with --keep-backup)"
@@ -104,6 +130,9 @@ for arg in "$@"; do
       echo "  # fully non-interactive (offline card):"
       echo "  sudo ./luks_encrypt.sh --device=/dev/sdX --yes --passphrase-file=/path/to/pass --tang=http://a,http://b --keep-backup"
       echo "  sudo ./luks_encrypt.sh --device=/dev/sdb"
+      echo "  # card prepared with luks_prepare.sh --usb-key (stick unlock next to tang):"
+      echo "  sudo ./luks_encrypt.sh --device=/dev/sdX --usb-key-file=/path/to/usb.key"
+      echo "  sudo ./luks_encrypt.sh --start-phase=clevis --usb-key-file=/path/to/usb.key"
       echo "  sudo ./luks_encrypt.sh --lv-size=50G"
       echo "  sudo ./luks_encrypt.sh --start-phase=clevis"
       echo "  sudo ./luks_encrypt.sh --start-phase=restore --backup-dir=/tmp/luks-backup.abc123"
@@ -117,6 +146,8 @@ for arg in "$@"; do
     --passphrase-file|--passphrase-file=) echo "--passphrase-file requires a value: --passphrase-file=/path/to/file"; exit 1 ;;
     --tang=?*) TANG_ARG="${arg#--tang=}" ;;
     --tang|--tang=) echo "--tang requires a value: --tang=http://a,http://b"; exit 1 ;;
+    --usb-key-file=?*) USB_KEY_FILE="${arg#--usb-key-file=}" ;;
+    --usb-key-file|--usb-key-file=) echo "--usb-key-file requires a value: --usb-key-file=/path/to/usb.key"; exit 1 ;;
     --keep-backup) KEEP_BACKUP=true ;;
     --remove-backup) REMOVE_BACKUP=true ;;
     --spi-only) SPI_ONLY=true ;;
@@ -433,7 +464,8 @@ _check_net_drivers() {
 # cryptsetup crypttab (otherwise the root is never unlocked and boot ends in
 # "ALERT! <root> does not exist") and clevis, and the network drivers of its
 # kernel if NET_DRIVERS is set (_check_net_drivers; needs the root mounted at
-# MOUNT_DST). With a checksum list from before
+# MOUNT_DST). With USB_KEY="yes" in luks.conf it also needs the clevis-keyfile scripts and
+# keyfile.conf inside and no etc/clevis-keyfile/fallback.key (_usbkey_check_listing). With a checksum list from before
 # the rebuild ("sha256  path" lines), every image must also have changed.
 # Usage: _verify_initramfs_images ["<sha256sum output before rebuild>"]
 # Returns 1 if any image is missing, stale or incomplete.
@@ -473,10 +505,14 @@ _verify_initramfs_images() {
       missing="yes"
       bad=1
     fi
+    if [ "$USB_KEY" = "yes" ] && ! _usbkey_check_listing "$name" "$listing"; then
+      missing="yes"
+      bad=1
+    fi
     if ! grep -q 'cryptroot/crypttab' <<<"$listing" || ! grep -q 'clevis' <<<"$listing" || [ -n "$missing" ]; then
       continue
     fi
-    ok "${name}: crypttab and clevis present ($(grep -c clevis <<<"$listing") clevis files)${NET_DRIVERS:+, network drivers checked: ${NET_DRIVERS}}"
+    ok "${name}: crypttab and clevis present ($(grep -c clevis <<<"$listing") clevis files)${NET_DRIVERS:+, network drivers checked: ${NET_DRIVERS}}${USB_KEY:+, USB key fallback present, no key inside}"
   done
   return "$bad"
 }
@@ -657,6 +693,7 @@ _fb_restore() {
 CLEANUP_MOUNTS=()
 CLEANUP_TMPDIR=()
 CLEANUP_LUKS=""
+CLEANUP_FILES=()    # temporary files with key material (removed right after use, here as safety net)
 BACKUP_DIR_FOR_CLEANUP=""
 
 cleanup() {
@@ -685,6 +722,11 @@ cleanup() {
   if [ -n "$CLEANUP_LUKS" ] && [ -b "/dev/mapper/$CLEANUP_LUKS" ]; then
     cryptsetup luksClose "$CLEANUP_LUKS" 2>/dev/null
   fi
+
+  # Temporary key files (normally removed right after use)
+  for f in "${CLEANUP_FILES[@]}"; do
+    if [ -n "$f" ]; then rm -f "$f"; fi
+  done
 
   # Remove temp mount dirs (NOT the backup - that's precious)
   for dir in "${CLEANUP_TMPDIR[@]}"; do
@@ -838,6 +880,228 @@ _find_backup_dir() {
   BACKUP_DIR_FOR_CLEANUP="$BACKUP_DIR"
   BACKUP_COUNT=$(find "$BACKUP_DIR" | wc -l)
   info "Using backup directory: $BACKUP_DIR ($BACKUP_COUNT files)"
+}
+
+# --- USB key (--usb-key-file): extra keyslot for the clevis-keyfile initramfs fallback ---
+# luks_prepare.sh --usb-key installs the initramfs side (hook, local-top and local-bottom
+# scripts, /etc/clevis-keyfile/keyfile.conf, USB_KEY="yes" in luks.conf). This script owns
+# the key: it creates or reads the key file, stores the master copy on the encrypted root
+# (/etc/clevis-keyfile/fallback.key, no trailing newline, read by
+# /root/clevis_keyfile_write_usb.sh) and adds it as a further keyslot. The key never goes
+# into the initramfs.
+
+# Fresh runs only: when luks.conf has not been read so far (script started from the card,
+# values handed over by the re-exec), look into the staged copy on the still unencrypted root.
+_usbkey_probe_conf() {
+  local m
+  m=$(mktemp -d /tmp/luks-conf-probe.XXXXXX)
+  if mount -o ro "$EXT_ROOT_PART" "$m" 2>/dev/null; then
+    if [ -f "$m/root/luks-staged/luks.conf" ]; then
+      _read_offline_conf "$m/root/luks-staged/luks.conf"
+    fi
+    umount "$m" 2>/dev/null || true
+  fi
+  rmdir "$m" 2>/dev/null || true
+}
+
+# luks.conf says USB_KEY="yes" but the option is missing: fatal (the initramfs carries the
+# fallback, the keyslot and the key would be missing). Option given but no USB_KEY in a
+# luks.conf that was read: warning, the run continues. Safe to call repeatedly.
+_usbkey_check_conf() {
+  if [ "$LUKS_CONF_READ" != true ] && [ "$START_PHASE_NUM" -le 2 ] && [ -b "${EXT_ROOT_PART:-}" ]; then
+    _usbkey_probe_conf
+  fi
+  if [ "$USB_KEY" = "yes" ] && [ -z "$USB_KEY_FILE" ]; then
+    fail "luks.conf has USB_KEY=\"yes\" (luks_prepare.sh --usb-key): the initramfs carries the USB key fallback, so this run needs --usb-key-file=<path> to create the keyslot (the file is created if it does not exist). Nothing was changed."
+  fi
+  if [ -n "$USB_KEY_FILE" ] && [ "$USB_KEY" != "yes" ] && [ "$LUKS_CONF_READ" = true ] && [ "$USB_KEY_WARNED" != true ]; then
+    USB_KEY_WARNED=true
+    warn "--usb-key-file is given, but luks.conf has no USB_KEY=\"yes\": the initramfs has no USB key watcher (run luks_prepare.sh --usb-key). The key and the keyslot are created anyway."
+  fi
+  return 0
+}
+
+# Load the USB key into USB_KEY_VALUE: an existing file is read (first line, newline stripped,
+# no owner or mode checks, never changed or deleted), a missing file is created with 48 random
+# bytes from /dev/urandom as one base64 line of 64 characters (mode 600, create only, no newline).
+_usbkey_prepare_key() {
+  local f="$USB_KEY_FILE" dir src label
+  [ -n "$f" ] || return 0
+  if [ -d "$f" ]; then
+    # A directory is the mounted stick: the key goes to <stick>/luks-keys/<host>.key, the
+    # layout the initramfs watcher reads (own host first, then every other *.key).
+    [ -n "$USB_KEY_HOST" ] || fail "--usb-key-file=${f} is a directory, but luks.conf has no USB_KEY_HOST (run luks_prepare.sh --usb-key first, or name the key file itself)"
+    src=$(findmnt -n -o SOURCE --target "$f" 2>/dev/null || true)
+    label=$(blkid -s LABEL -o value "$src" 2>/dev/null || true)
+    if [ "$label" != "${USB_KEY_LABEL:-LUKSKEY}" ]; then
+      warn "Filesystem under ${f} (${src:-unknown}) has label '${label}', the initramfs looks for '${USB_KEY_LABEL:-LUKSKEY}': relabel the stick (fatlabel / e2label) or the key will not be found at boot"
+    fi
+    f="${f%/}/luks-keys/${USB_KEY_HOST}.key"
+    if [ ! -d "$(dirname -- "$f")" ]; then
+      mkdir -p "$(dirname -- "$f")" || fail "Cannot create $(dirname -- "$f")"
+    fi
+    USB_KEY_FILE="$f"
+    info "USB key path on the stick: $f"
+  fi
+  if [ -e "$f" ]; then
+    [ -r "$f" ] || fail "USB key file not readable: $f"
+    if ! { IFS= read -r USB_KEY_VALUE || [ -n "$USB_KEY_VALUE" ]; } < "$f"; then
+      USB_KEY_VALUE=""
+    fi
+    [ -n "$USB_KEY_VALUE" ] || fail "USB key file is empty or unreadable (first line): $f"
+    info "Using the USB key from $f (first line, ${#USB_KEY_VALUE} characters, file left untouched)"
+  else
+    dir=$(dirname -- "$f")
+    { [ -d "$dir" ] && [ -w "$dir" ]; } || fail "Cannot create the USB key file ${f}: directory ${dir} does not exist or is not writable"
+    if ! ( set -o noclobber; umask 077; head -c 48 /dev/urandom | base64 -w0 > "$f" ); then
+      rm -f "$f" 2>/dev/null || true
+      fail "Could not create the USB key file $f"
+    fi
+    chmod 600 "$f" 2>/dev/null || warn "chmod 600 ${f} failed (vfat has no file modes); the stick is a plain-text key anyway"
+    if ! { IFS= read -r USB_KEY_VALUE || [ -n "$USB_KEY_VALUE" ]; } < "$f"; then
+      USB_KEY_VALUE=""
+    fi
+    [ "${#USB_KEY_VALUE}" -eq 64 ] || fail "Generated USB key has ${#USB_KEY_VALUE} characters instead of 64: $f"
+    ok "Generated a new USB key: $f (64 characters, mode 600, root owned if run with sudo)"
+    info "Keep this file: together with the card (or a stick) it unlocks the root without tang and passphrase."
+  fi
+}
+
+# Print the number of luks2 keyslots of a device (luksDump lines "  <n>: luks2").
+# Usage: _usbkey_slot_count <luks device>
+_usbkey_slot_count() {
+  local dump
+  dump=$(LC_ALL=C cryptsetup luksDump "$1") || fail "cryptsetup luksDump $1 failed"
+  grep -cE '^\s+[0-9]+: luks2$' <<<"$dump" || true
+}
+
+# Clevis phase: store the master copy of the key on the encrypted root and add it as a further
+# keyslot (authorised by the main passphrase). Fatal if the key does not unlock afterwards or
+# the slot count did not rise by one. Skips the add if the key is enrolled already (resume).
+_usbkey_enroll() {
+  [ -n "$USB_KEY_FILE" ] || return 0
+  local keypath tmp_main="" tmp_new before after added=false rc=0
+  echo ""
+  info "Adding the USB key as a further keyslot of $EXT_ROOT_PART..."
+  if [ -z "$MOUNT_DST" ] || ! mountpoint -q "$MOUNT_DST" 2>/dev/null; then
+    _ensure_luks_open
+    _ensure_root_mounted
+    _load_offline_state_from_root
+    _usbkey_check_conf
+  fi
+  [ -n "$USB_KEY_VALUE" ] || fail "Internal error: the USB key was not loaded"
+
+  keypath="${MOUNT_DST}${USB_KEY_ROOT_PATH}"
+  install -d -m 0700 "$(dirname "$keypath")"
+  ( umask 077; printf '%s' "$USB_KEY_VALUE" > "$keypath" )
+  chmod 600 "$keypath"
+  info "  Master copy: ${USB_KEY_ROOT_PATH} on the encrypted root (mode 600, no trailing newline)"
+
+  before=$(_usbkey_slot_count "$EXT_ROOT_PART")
+  tmp_new=$(mktemp /tmp/luks-usbkey.XXXXXX)
+  CLEANUP_FILES+=("$tmp_new")
+  chmod 600 "$tmp_new"
+  printf '%s' "$USB_KEY_VALUE" > "$tmp_new"
+
+  if cryptsetup open --test-passphrase --key-file "$tmp_new" "$EXT_ROOT_PART" >/dev/null 2>&1; then
+    info "  The USB key unlocks $EXT_ROOT_PART already (keyslot exists), not adding it again"
+  else
+    tmp_main=$(mktemp /tmp/luks-mainpass.XXXXXX)
+    CLEANUP_FILES+=("$tmp_main")
+    chmod 600 "$tmp_main"
+    printf '%s' "$LUKS_PASS" > "$tmp_main"
+    cryptsetup luksAddKey --key-file "$tmp_main" "$EXT_ROOT_PART" "$tmp_new" || rc=$?
+    rm -f "$tmp_main"
+    if [ "$rc" -ne 0 ]; then
+      rm -f "$tmp_new"
+      fail "cryptsetup luksAddKey failed (exit ${rc}): the USB key was not added. Resume with: sudo ./luks_encrypt.sh --start-phase=clevis --usb-key-file=${USB_KEY_FILE}${BACKUP_DIR:+ --backup-dir=$BACKUP_DIR}"
+    fi
+    added=true
+  fi
+
+  if ! cryptsetup open --test-passphrase --key-file "$tmp_new" "$EXT_ROOT_PART"; then
+    rm -f "$tmp_new"
+    fail "The USB key does not unlock $EXT_ROOT_PART after luksAddKey (cryptsetup open --test-passphrase failed)."
+  fi
+  rm -f "$tmp_new"
+  after=$(_usbkey_slot_count "$EXT_ROOT_PART")
+  if [ "$added" = true ] && [ "$after" -ne "$((before + 1))" ]; then
+    fail "Keyslot count is ${after} after adding the USB key, expected $((before + 1)) (before: ${before})."
+  fi
+  ok "USB key enrolled: ${after} keyslot(s), the key unlocks $EXT_ROOT_PART"
+}
+
+# Check one initramfs listing for the USB key fallback: scripts/local-top/clevis-keyfile,
+# scripts/local-bottom/clevis-keyfile and etc/clevis-keyfile/keyfile.conf must be inside,
+# etc/clevis-keyfile/fallback.key must not. Warns about every violation, returns 1 if any.
+# Usage: _usbkey_check_listing "<image name>" "<lsinitramfs listing>"
+_usbkey_check_listing() {
+  local name="$1" listing="$2" rc=0 p
+  for p in scripts/local-top/clevis-keyfile scripts/local-bottom/clevis-keyfile etc/clevis-keyfile/keyfile.conf; do
+    if ! grep -Eq "(^|/)${p//./\\.}\$" <<<"$listing"; then
+      warn "${name}: ${p} missing, the USB key would not be offered at boot"
+      rc=1
+    fi
+  done
+  if grep -Eq '(^|/)etc/clevis-keyfile/fallback\.key$' <<<"$listing"; then
+    warn "${name}: etc/clevis-keyfile/fallback.key is INSIDE the initramfs (the key must stay on the encrypted root only)"
+    rc=1
+  fi
+  return "$rc"
+}
+
+# Verification phase (USB_KEY="yes"): master copy equals the key, the stick writer script exists,
+# the key unlocks, and the keyslot count is 3 (passphrase, clevis, USB key; 2 if clevis is not
+# bound because tang was unreachable). Needs the root mounted at MOUNT_DST. Fatal on any miss.
+_usbkey_verify() {
+  [ "$USB_KEY" = "yes" ] || return 0
+  local keypath="${MOUNT_DST}${USB_KEY_ROOT_PATH}" want=2 got tmp
+  info "Verifying the USB key..."
+  if [ -z "$MOUNT_DST" ] || ! mountpoint -q "$MOUNT_DST" 2>/dev/null; then
+    fail "Root not mounted, cannot verify the USB key."
+  fi
+  [ -f "$keypath" ] || fail "${USB_KEY_ROOT_PATH} is missing on the encrypted root (resume with --start-phase=clevis --usb-key-file=...)"
+  if [ -n "$USB_KEY_VALUE" ]; then
+    tmp=$(mktemp /tmp/luks-usbkey.XXXXXX)
+    CLEANUP_FILES+=("$tmp")
+    chmod 600 "$tmp"
+    printf '%s' "$USB_KEY_VALUE" > "$tmp"
+    if ! cmp -s "$tmp" "$keypath"; then
+      rm -f "$tmp"
+      fail "${USB_KEY_ROOT_PATH} on the root differs from the key in ${USB_KEY_FILE}"
+    fi
+    rm -f "$tmp"
+  fi
+  [ -x "${MOUNT_DST}/root/clevis_keyfile_write_usb.sh" ] || fail "/root/clevis_keyfile_write_usb.sh is missing or not executable on the encrypted root"
+  if ! cryptsetup open --test-passphrase --key-file "$keypath" "$EXT_ROOT_PART"; then
+    fail "${USB_KEY_ROOT_PATH} does not unlock $EXT_ROOT_PART"
+  fi
+  if clevis luks list -d "$EXT_ROOT_PART" 2>/dev/null | grep -q .; then
+    want=3
+  else
+    warn "No clevis binding on $EXT_ROOT_PART: expecting 2 keyslots (passphrase, USB key) instead of 3"
+  fi
+  got=$(_usbkey_slot_count "$EXT_ROOT_PART")
+  [ "$got" -eq "$want" ] || fail "Expected ${want} keyslots on $EXT_ROOT_PART, found ${got}"
+  ok "USB key verified: master copy matches, unlocks the device, ${got} keyslots, write script present"
+}
+
+# Text for the end of the run (option given or USB_KEY="yes")
+_usbkey_next_steps() {
+  local host="${USB_KEY_HOST:-<host>}" label="${USB_KEY_LABEL:-LUKSKEY}" keysrc="${USB_KEY_FILE:-/path/to/usb.key}"
+  [ -n "$USB_KEY_FILE" ] || [ "$USB_KEY" = "yes" ] || return 0
+  echo "  USB stick unlock (fallback key, luks.conf USB_KEY=\"yes\"):"
+  echo "    Unlock order at boot: tang (clevis), stick, typed passphrase. The first valid answer wins;"
+  echo "    the stick may be plugged in while the passphrase prompt is shown. Stick plus card unlock"
+  echo "    the system without tang or passphrase."
+  echo "    Prepare the stick (any filesystem: vfat, exfat or ext4), label ${label}:"
+  echo "      mkfs.vfat -n ${label} /dev/sdY1        # or: e2label /dev/sdY1 ${label}"
+  echo "    Then put the key on it as luks-keys/${host}.key, either on the Pi after the first unlock:"
+  echo "      sudo /root/clevis_keyfile_write_usb.sh /dev/sdY1"
+  echo "    or by hand on the workstation (stick mounted at <mnt>; the key has no trailing newline):"
+  echo "      mkdir -p <mnt>/luks-keys"
+  echo "      head -n 1 ${keysrc} | tr -d '\n' | install -m 0400 /dev/stdin <mnt>/luks-keys/${host}.key"
+  echo ""
 }
 
 # =====================================================================
@@ -1173,7 +1437,8 @@ fi
 # =====================================================================
 
 # Read the offline mode keys from a luks.conf into FIRST_BOOT_PENDING,
-# NET_DRIVERS and OFFLINE_HOST_DEVICE. Values already set are kept.
+# NET_DRIVERS and OFFLINE_HOST_DEVICE, and the USB key keys into USB_KEY,
+# USB_KEY_LABEL and USB_KEY_HOST. Values already set are kept.
 # Usage: _read_offline_conf <luks.conf>
 _read_offline_conf() {
   local conf="$1" v
@@ -1183,6 +1448,13 @@ _read_offline_conf() {
   if [ -z "$NET_DRIVERS" ]; then NET_DRIVERS="$v"; fi
   v=$(grep '^OFFLINE_HOST_DEVICE=' "$conf" 2>/dev/null | cut -d'"' -f2 || true)
   if [ -z "$OFFLINE_HOST_DEVICE" ]; then OFFLINE_HOST_DEVICE="$v"; fi
+  v=$(grep '^USB_KEY=' "$conf" 2>/dev/null | cut -d'"' -f2 || true)
+  if [ -z "$USB_KEY" ]; then USB_KEY="$v"; fi
+  v=$(grep '^USB_KEY_LABEL=' "$conf" 2>/dev/null | cut -d'"' -f2 || true)
+  if [ -z "$USB_KEY_LABEL" ]; then USB_KEY_LABEL="$v"; fi
+  v=$(grep '^USB_KEY_HOST=' "$conf" 2>/dev/null | cut -d'"' -f2 || true)
+  if [ -z "$USB_KEY_HOST" ]; then USB_KEY_HOST="$v"; fi
+  LUKS_CONF_READ=true
 }
 
 # Make the scenario rpi_offline consistent: it is a Raspberry Pi card whose
@@ -1407,6 +1679,9 @@ if [ "$SCENARIO" = "rpi_offline" ]; then
   info "Offline scenario: the card has never been booted (first boot pending: ${FIRST_BOOT_PENDING})"
 fi
 
+# USB key: luks.conf with USB_KEY="yes" needs --usb-key-file (fails here, before the backup)
+_usbkey_check_conf
+
 # Migrate scenarios run on the board itself - treat as local mode
 if [ "$LOCAL_MODE" = false ]; then
   if [ "$SCENARIO" = "nvme_migrate" ] || [ "$SCENARIO" = "usb_migrate" ]; then
@@ -1526,6 +1801,9 @@ fi
 if [ -n "$NET_DRIVERS" ]; then
 echo "  Initramfs NIC modules: $NET_DRIVERS (checked in every initramfs)"
 fi
+if [ -n "$USB_KEY_FILE" ]; then
+echo "  USB key file:          $USB_KEY_FILE (extra keyslot, label ${USB_KEY_LABEL:-LUKSKEY})"
+fi
 if [ -n "$BACKUP_BASE" ]; then
   echo "  Backup location:       $BACKUP_BASE"
 fi
@@ -1562,6 +1840,9 @@ else
   echo -e "${RED}WARNING: This will ENCRYPT $EXT_ROOT_PART. Data will be backed up first.${NC}"
   _ask_confirm "Type 'YES' to proceed: " "--yes" yes YES || { echo "Aborted."; exit 0; }
 fi
+
+# USB key: read the key file or generate it (before the backup, so a bad file fails early)
+_usbkey_prepare_key
 
 # =====================================================================
 # 3. Backup root partition (skipped for migrate scenarios)
@@ -1808,6 +2089,7 @@ info "=== Phase 4: Boot Configuration ==="
 
 STAGED="${MOUNT_DST}/root/luks-staged"
 _load_offline_state_from_root
+_usbkey_check_conf
 
 if [ ! -d "$STAGED" ]; then
   fail "Staged directory not found at $STAGED"
@@ -1944,6 +2226,7 @@ if [ "$START_PHASE_NUM" -eq 6 ]; then
   _ensure_root_mounted
   _ensure_boot_mounted
   _load_offline_state_from_root
+  _usbkey_check_conf
 fi
 
 echo ""
@@ -2136,6 +2419,9 @@ else
   rm -f "$KEYFILE"
 fi
 
+# USB key: master copy on the root, further keyslot, proof that it unlocks (after the tang binding)
+_usbkey_enroll
+
 _check_target_health "Phase 6 (clevis)"
 
 fi  # end phase gate: clevis
@@ -2153,10 +2439,14 @@ clevis luks list -d "$EXT_ROOT_PART" 2>/dev/null || echo "  (none)"
 
 # Resumed after the initramfs phase on a never-booted card: the root and boot
 # partition are needed for the checks below
-if { _first_boot_pending || [ -n "$NET_DRIVERS" ]; } && [ "$START_PHASE_NUM" -ge 7 ]; then
+if { _first_boot_pending || [ -n "$NET_DRIVERS" ] || [ -n "$USB_KEY_FILE" ]; } && [ "$START_PHASE_NUM" -ge 7 ]; then
   _ensure_luks_open
   _ensure_root_mounted
   _ensure_boot_mounted
+  if [ -n "$USB_KEY_FILE" ]; then
+    _load_offline_state_from_root
+    _usbkey_check_conf
+  fi
 fi
 
 # Verify every initramfs image can unlock the encrypted root
@@ -2187,6 +2477,9 @@ if _first_boot_pending; then
   fi
   ok "Never-booted state verified (machine-id, SSH keys, cloud-init, seed files, cmdline.txt, no leftovers)"
 fi
+
+# USB key: master copy, writer script, unlock test and keyslot count (USB_KEY="yes" only)
+_usbkey_verify
 
 _check_target_health "Verification"
 
@@ -2370,6 +2663,10 @@ if [ "$SCENARIO" = "rpi_offline" ]; then
   echo "  3. Power on: the initramfs brings up the network, clevis unlocks the root via tang"
   echo "  4. Then the normal first boot runs: resize services, SSH host keys, cloud-init"
   echo "     (user, hostname, SSH keys, Wi-Fi from the seed on the boot partition)"
+  if [ -n "$USB_KEY_FILE" ] || [ "$USB_KEY" = "yes" ]; then
+    echo "  5. Optional: plug in the prepared USB stick (label ${USB_KEY_LABEL:-LUKSKEY}, see below) instead of"
+    echo "     relying on tang: stick plus card unlock the system without tang or passphrase"
+  fi
 
 elif _is_rpi; then
   echo -e "${YELLOW}Next steps:${NC}"
@@ -2420,13 +2717,20 @@ echo "    lvs                                  # should show ${LVM_LV_NAME} in V
 fi
 echo "    clevis luks list -d ${PI_ROOT_PART}  # should show SSS binding"
 echo "    /root/tang_check_connection.sh ${PI_ROOT_PART}"
+if [ -n "$USB_KEY_FILE" ] || [ "$USB_KEY" = "yes" ]; then
+echo "    cryptsetup luksDump ${PI_ROOT_PART} | grep -cE '^\\s+[0-9]+: luks2\$'   # USB key: prints 3 (passphrase, clevis, USB key)"
+echo "    cryptsetup open --test-passphrase --key-file ${USB_KEY_ROOT_PATH} ${PI_ROOT_PART}   # USB key: exit 0"
+fi
 echo ""
+if [ -n "$USB_KEY_FILE" ] || [ "$USB_KEY" = "yes" ]; then
+_usbkey_next_steps
+fi
 echo "  If clevis was not bound (tang unreachable), bind with:"
 echo "    sudo /root/setup_clevis_tang.sh"
 echo ""
 if [ "$SCENARIO" = "rpi_offline" ]; then
 echo "  Fully non-interactive run for the next card:"
-echo "    sudo ./luks_encrypt.sh --device=/dev/sdX --yes --passphrase-file=/path/to/pass --tang=http://a,http://b --keep-backup"
+echo "    sudo ./luks_encrypt.sh --device=/dev/sdX --yes --passphrase-file=/path/to/pass --tang=http://a,http://b --keep-backup${USB_KEY_FILE:+ --usb-key-file=$USB_KEY_FILE}"
 echo ""
 echo "  After the first boot (offline card), also check:"
 echo "    cloud-init status --long             # status: done, no errors"
